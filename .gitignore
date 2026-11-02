@@ -1,0 +1,21 @@
+# ข้อมูลนักเรียนและฐานข้อมูล: ห้ามขึ้น GitHub
+data/
+*.db
+*.sqlite3
+members*.csv
+*.xlsx
+
+# รหัสผ่าน
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# ไฟล์ระบบและไฟล์ชั่วคราว
+.DS_Store
+.tmp_stage/
+*.bak
