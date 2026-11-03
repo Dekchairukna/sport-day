@@ -25,6 +25,7 @@ staff = ui.staff_color_id()
 overview = [
     st.Page("views/board.py", title="กระดานผล", icon=":material/emoji_events:", default=staff is None),
     st.Page("views/schedule.py", title="ตารางแข่ง", icon=":material/calendar_month:"),
+    st.Page("views/medals.py", title="สรุปเหรียญ", icon=":material/workspace_premium:"),
     st.Page("views/reports.py", title="รายงาน", icon=":material/description:"),
 ]
 if staff is not None:  # สต๊าฟสี: หน้าสีตัวเอง + บันทึกผล/เช็คชื่อ ถ้าได้รับสิทธิ์
@@ -44,6 +45,7 @@ else:
         ("results", "views/results.py", "บันทึกผล", ":material/edit_note:"),
         ("attendance", "views/attendance.py", "เช็คชื่อ", ":material/fact_check:"),
         ("trophies", "views/trophies.py", "ถ้วยรางวัล", ":material/military_tech:"),
+        ("certificates", "views/certificates.py", "เกียรติบัตร", ":material/card_membership:"),
     ]
     registry = [
         ("members", "views/members.py", "สมาชิก", ":material/groups:"),
@@ -56,6 +58,6 @@ else:
         if allowed:
             pages[section] = allowed
 
-nav = st.navigation(pages)
+nav = st.navigation(pages, expanded=True)  # แสดงเมนูครบ ไม่ย่อเป็น View more
 ui.sidebar_login(engine)
 nav.run()

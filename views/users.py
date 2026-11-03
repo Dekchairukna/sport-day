@@ -14,7 +14,8 @@ st.caption("ผู้ดูแลระบบทำได้ทุกอย่�
 colors = sv.list_colors(engine)
 color_names = dict(zip(colors["id"], colors["name"]))
 SHORT = {"results": "บันทึกผล", "schedule": "ตารางแข่ง", "attendance": "เช็คชื่อ", "trophies": "ถ้วย",
-         "members": "สมาชิก", "colors": "ทุกสี", "move_color": "ย้ายสี", "settings": "ตั้งค่า"}
+         "members": "สมาชิก", "colors": "ทุกสี", "move_color": "ย้ายสี", "settings": "ตั้งค่า",
+         "certificates": "เกียรติบัตร"}
 
 
 def perm_text(r) -> str:

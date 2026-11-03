@@ -14,7 +14,8 @@ ui.require("settings")
 engine = ui.get_engine()
 st.title("ตั้งค่า")
 
-tab_gen, tab_import, tab_colors, tab_roles, tab_acts = st.tabs(["ทั่วไป", "นำเข้าข้อมูล", "สี", "หน้าที่", "กิจกรรมเช็คชื่อ"])
+tab_names = ["ทั่วไป", "นำเข้าข้อมูล", "สี", "หน้าที่", "กิจกรรมเช็คชื่อ"] + (["สำรองข้อมูล"] if ui.is_admin() else [])
+tab_gen, tab_import, tab_colors, tab_roles, tab_acts, *tab_backup = st.tabs(tab_names)
 
 with tab_gen:
     with st.form("gen"):
@@ -93,6 +94,24 @@ with tab_roles:
     st.caption("นักกีฬาไม่ต้องเพิ่มเป็นหน้าที่ ระบบใช้รายการแข่งในตารางแข่งแทน")
 
 with tab_acts:
+    st.markdown("#### รอบประจำวัน")
+    st.caption("ใช้กับปุ่ม สร้างรอบประจำวัน ในหน้าเช็คชื่อ (เช็คทุกคนในสี) · เพิ่ม/ลบแถวได้ เรียงตามลำดับเวลาในวัน")
+    act_names = sv.activities_df(engine)["name"].tolist()
+    cur = pd.DataFrame(sv.get_daily_rounds(engine))
+    edited = st.data_editor(
+        cur, key="daily_rounds_ed", num_rows="dynamic", hide_index=True, width="stretch",
+        column_config={
+            "slot": st.column_config.TextColumn("ช่วงเวลา", help="เช่น เช้า สาย บ่าย เย็น", required=True),
+            "activity": st.column_config.SelectboxColumn("กิจกรรม", options=act_names, required=True),
+        },
+    )
+    if st.button("บันทึกรอบประจำวัน", type="primary", key="daily_rounds_save"):
+        try:
+            sv.set_daily_rounds(engine, edited.to_dict("records"))
+            st.success("บันทึกแล้ว")
+        except ValueError as err:
+            st.error(str(err))
+    st.markdown("#### รายการกิจกรรม")
     st.caption("กิจกรรมที่ใช้ตอนสร้างรอบเช็คชื่อ เช่น เช็ครวมสี ซ้อมเชียร์ · ครูและสต๊าฟสีเพิ่มกิจกรรมใหม่ได้ตอนสร้างรอบ "
                "· กิจกรรมที่มีรอบเช็คชื่อแล้วลบไม่ได้ ให้ซ่อนแทน (ข้อมูลเดิมยังอยู่)")
     acts = sv.activities_df(engine, include_inactive=True)
@@ -116,3 +135,70 @@ with tab_acts:
         if c2.form_submit_button("เพิ่ม") and nm.strip():
             sv.add_activity(engine, nm)
             st.rerun()
+
+if tab_backup:
+    from datetime import datetime
+
+    from sqlalchemy import create_engine
+
+    from sportsday.db import local_db_path
+
+    TABLE_TH = {"students": "นักเรียน", "events": "รายการแข่ง", "results": "ผลแข่ง", "entries": "นักกีฬา",
+                "attendance": "เช็คชื่อ (คน-ครั้ง)", "att_sessions": "รอบเช็คชื่อ", "users": "ผู้ใช้", "awards": "รางวัลพิเศษ"}
+
+    def show_counts(counts: dict) -> str:
+        return " · ".join(f"{v} {counts.get(k, 0)}" for k, v in TABLE_TH.items())
+
+    with tab_backup[0]:
+        temp = ui.storage_is_temporary(engine)
+        if engine.dialect.name == "postgresql":
+            st.success("ข้อมูลเก็บในฐานข้อมูลถาวร (PostgreSQL) · อัปเดตโค้ดหรือรีบูตแอปแล้วข้อมูลไม่หาย")
+        elif temp:
+            st.error("ข้อมูลบนเว็บนี้เก็บในไฟล์ชั่วคราวบนเซิร์ฟเวอร์ Streamlit และจะหายเมื่อแอปเริ่มใหม่ "
+                     "(เช่น แอปหลับแล้วถูกปลุก หรือกด Reboot) · ดาวน์โหลดสำรองไว้ แล้วตั้ง db_url ตามขั้นตอนด้านล่าง")
+        else:
+            st.info("ข้อมูลเก็บในไฟล์บนคอมพิวเตอร์เครื่องนี้ (data/sportsday.db)")
+        st.caption("ข้อมูลตอนนี้: " + show_counts(sv.data_counts(engine)))
+
+        st.markdown("#### ดาวน์โหลดสำรองข้อมูล")
+        st.caption("ไฟล์เดียวมีทุกอย่าง: นักเรียน ตารางแข่ง ผลแข่ง เช็คชื่อ ผู้ใช้ ตั้งค่า · เก็บไว้ในที่ปลอดภัย "
+                   "เพราะมีข้อมูลนักเรียนและรหัสผ่านแบบเข้ารหัส")
+        st.download_button("ดาวน์โหลดไฟล์สำรอง", sv.export_backup(engine),
+                           f"สำรองกีฬาสี_{datetime.now():%Y-%m-%d_%H%M}.json", "application/json",
+                           type="primary", key="bk_dl")
+
+        legacy = local_db_path()
+        if engine.dialect.name == "postgresql" and legacy.exists():
+            st.markdown("#### ย้ายข้อมูลจากไฟล์เดิมบนเซิร์ฟเวอร์")
+            try:
+                old = create_engine(f"sqlite:///{legacy}")
+                old_counts = sv.data_counts(old)
+            except Exception:  # ไฟล์เดิมเปิดไม่ได้หรือโครงสร้างเก่าเกินไป
+                old, old_counts = None, {}
+            if old is not None and old_counts.get("students", 0):
+                st.caption("พบข้อมูลในไฟล์เดิม: " + show_counts(old_counts))
+                st.warning("ข้อมูลในฐานข้อมูลถาวรตอนนี้จะถูกแทนที่ด้วยข้อมูลจากไฟล์เดิมทั้งหมด")
+                ok = st.checkbox("ยืนยันการย้ายข้อมูล", key="bk_mig_ok")
+                if st.button("ย้ายข้อมูลจากไฟล์เดิมเข้าฐานข้อมูลถาวร", type="primary", disabled=not ok, key="bk_mig"):
+                    from sportsday.db import make_engine
+                    counts = sv.import_backup(engine, sv.export_backup(make_engine(f"sqlite:///{legacy}")))
+                    st.session_state.clear()  # ผู้ใช้ชุดใหม่: เข้าสู่ระบบใหม่ด้วยบัญชีเดิมบนเว็บ
+                    st.session_state["bk_flash"] = "ย้ายแล้ว: " + show_counts(counts)
+                    st.rerun()
+            else:
+                st.caption("ไม่พบข้อมูลในไฟล์เดิม (ไฟล์อาจหายไปแล้วเพราะแอปเริ่มใหม่) ใช้การกู้คืนจากไฟล์สำรองด้านล่างแทน")
+
+        st.markdown("#### กู้คืนจากไฟล์สำรอง")
+        up = st.file_uploader("เลือกไฟล์สำรอง (.json)", type=["json"], key="bk_up")
+        if up is not None:
+            try:
+                st.caption("ในไฟล์มี: " + show_counts(sv.backup_summary(up.getvalue())))
+                st.warning("ข้อมูลทั้งหมดตอนนี้จะถูกแทนที่ด้วยข้อมูลในไฟล์ แล้วต้องเข้าสู่ระบบใหม่")
+                ok = st.checkbox("ยืนยันการกู้คืน", key="bk_rs_ok")
+                if st.button("กู้คืนข้อมูล", type="primary", disabled=not ok, key="bk_rs"):
+                    counts = sv.import_backup(engine, up.getvalue())
+                    st.session_state.clear()
+                    st.session_state["bk_flash"] = "กู้คืนแล้ว: " + show_counts(counts)
+                    st.rerun()
+            except (ValueError, KeyError) as err:
+                st.error(f"อ่านไฟล์ไม่ได้: {err}")

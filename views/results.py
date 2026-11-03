@@ -59,12 +59,29 @@ with st.form(f"res_form_{eid}"):
                           placeholder="เช่น 2-1 เซต", key=f"res_score_{eid}")
     note = c2.text_input("หมายเหตุ", value=e["result_note"] if isinstance(e["result_note"], str) else "",
                          key=f"res_note_{eid}")
+    second = third = None
+    if len(names) > 2:  # มีมากกว่า 2 สี: ระบุรองชนะเลิศเพื่อนับเหรียญเงิน/ทองแดง
+        cur_pl = sv.event_places(engine)
+        cur_pl = dict(zip(cur_pl[cur_pl.event_id == eid].place, cur_pl[cur_pl.event_id == eid].color_id))
+        id2name = dict(zip(colors["id"], colors["name"]))
+        opts = ["-"] + names
+        c1, c2 = st.columns(2)
+        second = c1.selectbox("รองชนะเลิศอันดับ 1 (เหรียญเงิน)", opts, key=f"res_2_{eid}",
+                              index=opts.index(id2name.get(cur_pl.get(2), "-")))
+        third = c2.selectbox("รองชนะเลิศอันดับ 2 (เหรียญทองแดง)", opts, key=f"res_3_{eid}",
+                             index=opts.index(id2name.get(cur_pl.get(3), "-")))
+        second, third = (None if second == "-" else second), (None if third == "-" else third)
+    else:
+        st.caption("มี 2 สี: สีที่ชนะได้เหรียญทอง อีกสีได้เหรียญเงินอัตโนมัติ")
     if st.form_submit_button("บันทึกผล", type="primary"):
         if winner is None:
             st.error("เลือกสีที่ชนะก่อนบันทึก")
         else:
             cid = int(colors.set_index("name").loc[winner, "id"])
             sv.set_result(engine, int(eid), cid, score, note, ui.editor_name())
+            places = {int(colors.set_index("name").loc[n, "id"]): p
+                      for p, n in ((2, second), (3, third)) if n and n != winner}
+            sv.set_places(engine, int(eid), places)
             st.success(f"บันทึกแล้ว: สี{winner} ได้ถ้วย {e['name']} · กระดานผลอัปเดตภายใน 30 วินาที")
 
 if isinstance(e["winner"], str):

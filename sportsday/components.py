@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import html
 from datetime import datetime
 
 import pandas as pd
@@ -191,6 +192,8 @@ def attendance_panel(engine, key: str, color_id: int | None = None) -> None:
     pick_key = f"{key}_session"
 
     with tab_new:
+        daily_rounds_form(engine, key, color_id)
+        st.markdown("#### หรือสร้างรอบเดียว")
         # ไม่ใช้ st.form เพื่อให้ช่องเปลี่ยนตามตัวเลือกทันที · n เปลี่ยน key เพื่อล้างช่องหลังสร้างเสร็จ
         n = st.session_state.get(f"{key}_new_n", 0)
         k = f"{key}_n{n}"
@@ -252,50 +255,35 @@ def attendance_panel(engine, key: str, color_id: int | None = None) -> None:
 
     with tab_check:
         if ses.empty:
-            st.info("ยังไม่มีรอบเช็คชื่อ สร้างได้ที่แท็บ สร้างรอบใหม่")
+            st.info("ยังไม่มีรอบเช็คชื่อ")
+            daily_rounds_form(engine, f"{key}_quick", color_id, compact=True)
         else:
-            act_list = ["ทุกกิจกรรม"] + list(dict.fromkeys(ses["activity"]))
-            f_act = st.selectbox("กิจกรรม", act_list, key=f"{key}_fact")
-            if f_act != "ทุกกิจกรรม":
-                ses = ses[ses.activity == f_act]
-            opts = dict(zip(ses["id"], "[" + ses["activity"] + "] " + ses["title"] + " · "
-                            + pd.to_datetime(ses["date"]).dt.date.map(thai_date)))
-            ids = list(opts)
-            default = st.session_state.get(pick_key)
-            sid = st.selectbox("รอบ", ids, index=ids.index(default) if default in ids else 0,
-                               format_func=opts.get, key=f"{key}_pick")
-            roster = sv.session_roster(engine, int(sid))
-            if roster.empty:
-                st.warning("รอบนี้ยังไม่มีรายชื่อ (เช่น ยังไม่ได้จัดนักกีฬาในรายการ หรือยังไม่มีใครได้หน้าที่นี้)")
+            today = datetime.now().date()
+            days = sorted(ses["day"].unique(), reverse=True)
+            if today not in days:
+                with st.container(border=True):
+                    st.caption("วันนี้ยังไม่มีรอบเช็คชื่อ")
+                    daily_rounds_form(engine, f"{key}_quick", color_id, compact=True)
+            picked = st.session_state.get(pick_key)
+            picked_day = ses.set_index("id")["day"].get(picked) if picked in set(ses["id"]) else None
+            day_default = picked_day or (today if today in days else days[0])
+            day = st.selectbox("วันที่", days, index=days.index(day_default), format_func=thai_date,
+                               key=f"{key}_day_{day_default}")
+            day_ses = ses[ses["day"] == day]
+            ids = day_ses["id"].tolist()
+            labels = dict(zip(day_ses["id"], day_ses["title"].str.replace(r"\s*\(สี.*\)$", "", regex=True)
+                              + " · " + day_ses["activity"]))
+            if picked in ids:
+                idx = ids.index(picked)
+            elif day == today:  # เดารอบตามเวลาตอนนี้: ก่อน 10 โมง = รอบแรก, ก่อนบ่ายโมง = รอบสอง, หลังจากนั้น = รอบสาม
+                h = datetime.now().hour
+                idx = min(len(ids) - 1, 0 if h < 10 else 1 if h < 13 else 2)
             else:
-                cnt = roster["status"].value_counts()
-                m = st.columns(5)
-                for col, s in zip(m, sv.ATT_STATUSES + [""]):
-                    col.metric(s or "ยังไม่เช็ค", int(cnt.get(s, 0)))
-                ed_key = f"{key}_editor_{sid}"
-                if st.button("ทำเครื่องหมาย มา ทุกคนที่ยังไม่เช็ค", key=f"{key}_allin"):
-                    roster.loc[roster["status"] == "", "status"] = "มา"
-                    sv.save_attendance(engine, int(sid), roster.to_dict("records"))
-                    st.session_state.pop(ed_key, None)
-                    st.rerun()
-                out = st.data_editor(
-                    roster, key=ed_key, hide_index=True, width="stretch",
-                    disabled=["student_id", "full_name", "class", "color"],
-                    column_config={
-                        "student_id": None, "full_name": "ชื่อ-สกุล", "class": "ชั้น", "color": "สี",
-                        "status": st.column_config.SelectboxColumn("สถานะ", options=sv.ATT_STATUSES),
-                        "note": "หมายเหตุ",
-                    },
-                )
-                c1, c2 = st.columns([1, 3])
-                if c1.button("บันทึกการเช็คชื่อ", type="primary", key=f"{key}_save"):
-                    st.success(f"บันทึกแล้ว {sv.save_attendance(engine, int(sid), out.to_dict('records'))} คน")
-                with c2.expander("ลบรอบนี้"):
-                    if st.checkbox("ยืนยันการลบรอบและผลเช็คชื่อทั้งหมดของรอบนี้", key=f"{key}_del_ok_{sid}"):
-                        if st.button("ลบรอบ", key=f"{key}_del_{sid}"):
-                            sv.delete_session(engine, int(sid))
-                            st.session_state.pop(pick_key, None)
-                            st.rerun()
+                idx = 0
+            sid = int(st.radio("รอบ", ids, index=idx, format_func=labels.get, horizontal=True,
+                               key=f"{key}_round_{day}_{ids[idx]}"))
+            st.session_state[pick_key] = sid
+            checklist(engine, key, sid)
 
     with tab_sum:
         st.markdown("#### แยกตามกิจกรรม")
@@ -321,6 +309,115 @@ def attendance_panel(engine, key: str, color_id: int | None = None) -> None:
             st.dataframe(view, hide_index=True, width="stretch",
                          column_config={"ร้อยละมา": st.column_config.ProgressColumn("ร้อยละมา", min_value=0, max_value=100, format="%d%%")})
             st.caption("นับ สาย เป็นการมา · ใช้ดูว่าใครขาดบ่อยเพื่อติดตามตัว")
+
+
+def daily_rounds_form(engine, key: str, color_id: int | None, compact: bool = False) -> None:
+    """สร้างรอบประจำวัน (เช่น เช้า ประชุมสี · สาย/บ่าย ซ้อมเชียร์) ทีละหลายวันในกดเดียว"""
+    rounds = sv.get_daily_rounds(engine)
+    text = " · ".join(f"{r['slot']}: {r['activity']}" for r in rounds)
+    colors = sv.list_colors(engine)
+    today = datetime.now().date()
+    if compact:
+        if st.button(f"สร้างรอบประจำวันของวันนี้ ({text})", type="primary", key=f"{key}_dq", width="stretch"):
+            ids = [color_id] if color_id is not None else colors["id"].tolist()
+            sv.create_daily_rounds(engine, today, today, ids)
+            st.rerun()
+        return
+    with st.container(border=True):
+        st.markdown("#### รอบประจำวัน")
+        st.caption(f"{text} · เช็คทุกคนในสี · แก้ช่วงเวลาและกิจกรรมได้ที่ ตั้งค่า → กิจกรรมเช็คชื่อ")
+        rng = st.date_input("ช่วงวันที่ (เลือกวันเดียวหรือหลายวัน เช่น ทั้งช่วงก่อนแข่ง)", value=(today, today),
+                            format="DD/MM/YYYY", key=f"{key}_drange")
+        if color_id is None:
+            opts = dict(zip(colors["id"], "สี" + colors["name"]))
+            pick = st.multiselect("สี", list(opts), default=list(opts), format_func=opts.get, key=f"{key}_dcolors")
+        else:
+            pick = [color_id]
+        if st.button("สร้างรอบประจำวัน", type="primary", key=f"{key}_dgo", width="stretch"):
+            start, end = (rng + (rng[0],))[:2] if isinstance(rng, tuple) and rng else (rng, rng)
+            if not pick:
+                st.error("เลือกสีอย่างน้อย 1 สี")
+            else:
+                try:
+                    made, skip = sv.create_daily_rounds(engine, start, end, pick)
+                    msg = f"สร้าง {made} รอบ" + (f" · ข้าม {skip} รอบที่มีอยู่แล้ว" if skip else "")
+                    st.session_state[f"{key}_dflash"] = msg
+                    st.rerun()
+                except ValueError as err:
+                    st.error(str(err))
+        if msg := st.session_state.pop(f"{key}_dflash", None):
+            st.success(msg + " · ไปเช็คได้ที่แท็บ เช็คชื่อ")
+
+
+def checklist(engine, key: str, sid: int) -> None:
+    """เช็คชื่อแบบกดปุ่มรายคน ใช้บนมือถือได้ · กดแล้วบันทึกทันที"""
+    roster = sv.session_roster(engine, sid)
+    if roster.empty:
+        st.warning("รอบนี้ยังไม่มีรายชื่อ (เช่น ยังไม่ได้จัดนักกีฬาในรายการ หรือยังไม่มีใครได้หน้าที่นี้)")
+        return
+    ver_key = f"{key}_ver_{sid}"  # เปลี่ยนเมื่อแก้ทีละหลายคน เพื่อให้ปุ่มทุกแถวอ่านค่าใหม่
+    ver = st.session_state.get(ver_key, 0)
+
+    cnt = roster["status"].value_counts()
+    done = int((roster["status"] != "").sum())
+    st.progress(done / len(roster), text=" · ".join(
+        [f"{s} {int(cnt.get(s, 0))}" for s in sv.ATT_STATUSES] + [f"ยังไม่เช็ค {len(roster) - done}"]))
+
+    c1, c2 = st.columns(2)
+    q = c1.text_input("ค้นหาชื่อ", placeholder="พิมพ์ชื่อหรือนามสกุล", key=f"{key}_q_{sid}")
+    classes = ["ทุกห้อง"] + sorted(roster["class"].unique(), key=lambda c: [int(x) if x.isdigit() else x
+                                                                          for x in c.replace("ม.", "").split("/")])
+    room = c2.selectbox("ห้อง", classes, key=f"{key}_room_{sid}")
+    only_left = st.toggle("แสดงเฉพาะคนที่ยังไม่เช็ค", value=False, key=f"{key}_left_{sid}")
+
+    view = roster
+    if room != "ทุกห้อง":
+        view = view[view["class"] == room]
+    if q.strip():
+        view = view[view["full_name"].str.contains(q.strip(), regex=False)]
+    if only_left:
+        view = view[view["status"] == ""]
+
+    left = view[view["status"] == ""]
+    if len(left) and st.button(f"มาทั้งหมด ({len(left)} คนที่ยังไม่เช็คในรายชื่อด้านล่าง)", key=f"{key}_all_{sid}",
+                               width="stretch"):
+        sv.mark_unchecked(engine, sid, left["student_id"])
+        st.session_state[ver_key] = ver + 1
+        st.rerun()
+
+    def save(student_id: int, wkey: str) -> None:
+        sv.set_attendance_one(engine, sid, student_id, st.session_state.get(wkey))
+
+    if view.empty:
+        st.caption("ไม่มีรายชื่อตามที่กรอง")
+    for r in view.itertuples():
+        wkey = f"{key}_s{sid}_v{ver}_{r.student_id}"
+        with st.container(key=f"attrow_{key}_{sid}_{r.student_id}"):
+            st.markdown(f"**{html.escape(r.full_name)}** <span class='muted'>{r._3}</span>", unsafe_allow_html=True)
+            st.segmented_control("สถานะ", sv.ATT_STATUSES, default=r.status or None, key=wkey,
+                                 label_visibility="collapsed", on_change=save, args=(int(r.student_id), wkey))
+
+    with st.expander("แก้แบบตาราง / ใส่หมายเหตุ (สะดวกบนคอมพิวเตอร์)"):
+        ed_key = f"{key}_editor_{sid}_v{ver}"
+        out = st.data_editor(
+            roster, key=ed_key, hide_index=True, width="stretch",
+            disabled=["student_id", "full_name", "class", "color"],
+            column_config={
+                "student_id": None, "full_name": "ชื่อ-สกุล", "class": "ชั้น", "color": "สี",
+                "status": st.column_config.SelectboxColumn("สถานะ", options=sv.ATT_STATUSES),
+                "note": "หมายเหตุ",
+            },
+        )
+        if st.button("บันทึกตาราง", type="primary", key=f"{key}_save_{sid}"):
+            sv.save_attendance(engine, sid, out.to_dict("records"))
+            st.session_state[ver_key] = ver + 1
+            st.rerun()
+    with st.expander("ลบรอบนี้"):
+        if st.checkbox("ยืนยันการลบรอบและผลเช็คชื่อทั้งหมดของรอบนี้", key=f"{key}_del_ok_{sid}"):
+            if st.button("ลบรอบ", key=f"{key}_del_{sid}"):
+                sv.delete_session(engine, sid)
+                st.session_state.pop(f"{key}_session", None)
+                st.rerun()
 
 
 # ---------------------------------------------------------------- เสื้อสี

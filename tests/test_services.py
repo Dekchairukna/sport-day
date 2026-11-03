@@ -257,3 +257,166 @@ def test_old_database_gets_activity_column(tmp_path):
     eng = make_engine(f"sqlite:///{path}")
     sv.seed_defaults(eng)
     assert sv.sessions_df(eng).set_index("title").loc["เก่า", "activity"] == "เช็ครวมสี"
+
+
+def test_daily_rounds_and_quick_check(engine):
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    blue = sv.color_id_by_name(engine, "น้ำเงิน")
+    a = _student(engine, "ก", "ชาย", 1)
+    b = _student(engine, "ข", "หญิง", 2)
+    assert [r["slot"] for r in sv.get_daily_rounds(engine)] == ["เช้า", "สาย", "บ่าย"]
+    made, skip = sv.create_daily_rounds(engine, date(2026, 11, 4), date(2026, 11, 5), [pink, blue])
+    assert (made, skip) == (12, 0)  # 2 วัน x 2 สี x 3 รอบ
+    assert sv.create_daily_rounds(engine, date(2026, 11, 5), date(2026, 11, 5), [pink]) == (0, 3)  # ไม่สร้างซ้ำ
+    ses = sv.sessions_df(engine)
+    day = ses[(ses["day"] == date(2026, 11, 4)) & (ses.color_id == pink)]
+    assert day["title"].tolist() == ["เช้า (สีชมพู)", "สาย (สีชมพู)", "บ่าย (สีชมพู)"]  # เรียงตามเวลา
+    assert day["activity"].tolist() == ["ประชุมสี", "ซ้อมเชียร์", "ซ้อมเชียร์"]
+    sid = int(day.iloc[0]["id"])
+    sv.set_attendance_one(engine, sid, a, "สาย")
+    assert sv.mark_unchecked(engine, sid, [a, b]) == 1  # ไม่ทับ a ที่เช็คแล้ว
+    roster = sv.session_roster(engine, sid).set_index("student_id")
+    assert roster.loc[a, "status"] == "สาย" and roster.loc[b, "status"] == "มา"
+    sv.set_attendance_one(engine, sid, b, None)  # กดซ้ำเพื่อยกเลิก
+    assert sv.session_roster(engine, sid).set_index("student_id").loc[b, "status"] == ""
+    sv.set_daily_rounds(engine, [{"slot": "เย็น", "activity": "ซ้อมแปรอักษร"}, {"slot": "", "activity": "x"}])
+    assert sv.get_daily_rounds(engine) == [{"slot": "เย็น", "activity": "ซ้อมแปรอักษร"}]
+    with pytest.raises(ValueError):
+        sv.set_daily_rounds(engine, [{"slot": "เช้า", "activity": "ก"}, {"slot": "เช้า", "activity": "ข"}])
+
+
+def _event_with(engine, sport, gender, level, ids):
+    eid = sv.add_event(engine, sport, gender, level, date(2026, 11, 20), "09:00", 30, "สนาม")
+    sv.set_event_entries(engine, eid, ids)
+    return eid
+
+
+def test_medals_two_colors(engine):
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    blue = sv.color_id_by_name(engine, "น้ำเงิน")
+    p1 = _student(engine, "ชมพู1", "ชาย", 1, "ชมพู")
+    b1 = _student(engine, "ฟ้า1", "ชาย", 1, "น้ำเงิน")
+    e1 = _event_with(engine, "แบดมินตัน", "ชาย", "ต้น", [p1, b1])
+    e2 = _event_with(engine, "ปิงปอง", "ชาย", "ต้น", [p1, b1])
+    sv.set_result(engine, e1, pink)
+    sv.set_result(engine, e2, pink)
+    mt = sv.medal_table(engine).set_index("name")
+    assert (mt.loc["ชมพู", "ทอง"], mt.loc["ชมพู", "เงิน"]) == (2, 0)
+    assert (mt.loc["น้ำเงิน", "ทอง"], mt.loc["น้ำเงิน", "เงิน"]) == (0, 2)  # 2 สี: สีที่แพ้ได้เงินอัตโนมัติ
+    assert sv.medal_table(engine).iloc[0]["name"] == "ชมพู"
+    lb = sv.athlete_leaderboard(engine).set_index("student_id")
+    assert lb.loc[p1, "ทอง"] == 2 and lb.loc[b1, "เงิน"] == 2
+    assert sv.athlete_leaderboard(engine).iloc[0]["student_id"] == p1
+    sv.clear_result(engine, e2)
+    assert sv.medal_table(engine).set_index("name").loc["ชมพู", "ทอง"] == 1
+
+
+def test_medals_three_colors_and_certificates(engine):
+    from sportsday import reports as rp
+    green = sv.add_color(engine, "เขียว", "#2a9d55")
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    blue = sv.color_id_by_name(engine, "น้ำเงิน")
+    p1 = _student(engine, "ชมพู1", "หญิง", 2, "ชมพู")
+    b1 = _student(engine, "ฟ้า1", "หญิง", 2, "น้ำเงิน")
+    g1 = _student(engine, "เขียว1", "หญิง", 2, "เขียว")
+    e1 = _event_with(engine, "แชร์บอล", "หญิง", "ต้น", [p1, b1, g1])
+    sv.set_result(engine, e1, green)
+    assert sv.medal_table(engine).set_index("name").loc["ชมพู", "รวม"] == 0  # 3 สี: ยังไม่ระบุรองชนะเลิศ
+    sv.set_places(engine, e1, {blue: 2, pink: 3})
+    mt = sv.medal_table(engine).set_index("name")
+    assert (mt.loc["เขียว", "ทอง"], mt.loc["น้ำเงิน", "เงิน"], mt.loc["ชมพู", "ทองแดง"]) == (1, 1, 1)
+    medal = rp.certificate_items(engine, "medal")
+    assert dict(zip(medal.student_id, medal.achievement)) == {
+        g1: "ได้รับรางวัลชนะเลิศ", b1: "ได้รับรางวัลรองชนะเลิศอันดับ 1", p1: "ได้รับรางวัลรองชนะเลิศอันดับ 2"}
+    assert list(rp.certificate_items(engine, "medal", places=(1,)).student_id) == [g1]
+    assert len(rp.certificate_items(engine, "join", color="ชมพู")) == 1
+    sv.seed_users(engine, "9999")
+    aid = sv.add_award(engine, "นักกีฬายอดเยี่ยมหญิง", g1)
+    with pytest.raises(ValueError):
+        sv.add_award(engine, "นักกีฬายอดเยี่ยมหญิง", g1)
+    aw = rp.certificate_items(engine, "award")
+    assert aw.iloc[0]["achievement"] == "ได้รับรางวัลนักกีฬายอดเยี่ยมหญิง"
+    sv.save_cert_settings(engine, [{"name": "นายก", "position": "ผู้อำนวยการ"}, {"name": "", "position": ""}], "", "กส./")
+    assert sv.cert_settings(engine)["signers"] == [{"name": "นายก", "position": "ผู้อำนวยการ"}]
+    pdf = rp.certificate_pdf(engine, medal)
+    assert pdf.startswith(b"%PDF") and pdf.count(b"/Type /Page\n") + pdf.count(b"/Type /Page>") >= 1
+    assert rp.certificate_register(medal, "กส./")[:2] == b"PK"
+    sv.delete_award(engine, aid)
+    assert sv.awards_df(engine).empty
+
+
+def test_best_athletes_by_total_medals(engine):
+    from sportsday import reports as rp
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    blue = sv.color_id_by_name(engine, "น้ำเงิน")
+    gold1 = _student(engine, "ทองเดียว", "ชาย", 1, "ชมพู")
+    many = _student(engine, "เหรียญเยอะ", "ชาย", 1, "น้ำเงิน")
+    girl1 = _student(engine, "หญิงหนึ่ง", "หญิง", 1, "ชมพู")
+    girl2 = _student(engine, "หญิงสอง", "หญิง", 1, "ชมพู")
+    e1 = _event_with(engine, "วิ่ง", "ชาย", "ต้น", [gold1, many])
+    sv.set_result(engine, e1, pink)  # gold1 ทอง 1, many เงิน 1
+    for sport in ("กระโดดไกล", "ทุ่มน้ำหนัก"):
+        e = _event_with(engine, sport, "ชาย", "ต้น", [many])
+        sv.set_result(engine, e, pink)  # many ลงคนเดียว สีน้ำเงินแพ้ = เงิน
+    e4 = _event_with(engine, "แบดมินตัน", "หญิง", "ต้น", [girl1, girl2])
+    sv.set_result(engine, e4, pink)  # ทั้งคู่ได้ทอง 1 เท่ากัน
+    best = sv.best_athletes(engine)
+    men = best[best.title == "นักกีฬายอดเยี่ยมชาย"]
+    assert men["student_id"].tolist() == [many]  # เงิน 3 เหรียญ ชนะ ทอง 1 เหรียญ เพราะนับเหรียญรวม
+    women = best[best.title == "นักกีฬายอดเยี่ยมหญิง"]
+    assert set(women["student_id"]) == {girl1, girl2} and women["tie"].all()  # เท่ากันทุกอย่าง = รางวัลร่วม
+    assert sv.athlete_leaderboard(engine).iloc[0]["student_id"] == many
+    certs = rp.certificate_items(engine, "award")
+    assert len(certs) == 3 and "เหรียญรวม 3" in certs.set_index("student_id").loc[many, "detail"]
+
+
+def _fill_some(engine):
+    sv.seed_users(engine, "9999")
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    a = _student(engine, "สำรอง", "ชาย", 1, "ชมพู")
+    eid = _event_with(engine, "วิ่งผลัด", "ชาย", "ต้น", [a])
+    sv.set_result(engine, eid, pink, "1-0", recorded_by="ครู")
+    sid = sv.create_session(engine, "เช้า", date(2026, 11, 4), color_id=pink)
+    sv.set_attendance_one(engine, sid, a, "สาย")
+    sv.create_user(engine, "kru1", "secret1", "staff", "ครูหนึ่ง", perms=["results"])
+    return a, eid, sid
+
+
+def test_backup_roundtrip_sqlite(engine, tmp_path):
+    a, eid, sid = _fill_some(engine)
+    data = sv.export_backup(engine)
+    assert sv.backup_summary(data)["students"] == 1
+    other = make_engine(f"sqlite:///{tmp_path / 'new.db'}")
+    sv.seed_defaults(other)
+    sv.seed_users(other, "1234")  # ฐานข้อมูลใหม่มีค่าเริ่มต้นอยู่แล้ว ต้องถูกแทนที่ทั้งหมด
+    sv.import_backup(other, data)
+    assert sv.data_counts(other) == sv.data_counts(engine)
+    assert sv.authenticate(other, "kru1", "secret1")["display_name"] == "ครูหนึ่ง"
+    assert sv.authenticate(other, "admin", "9999") and sv.authenticate(other, "admin", "1234") is None
+    assert sv.session_roster(other, sid).set_index("student_id").loc[a, "status"] == "สาย"
+    ev = sv.events_df(other).set_index("id")
+    assert ev.loc[eid, "winner"] == "ชมพู" and ev.loc[eid, "recorded_by"] == "ครู"
+    new_id = sv.add_student(other, code="x", prefix="", first_name="ใหม่", last_name="", gender="ชาย", grade=1, room=1)
+    assert new_id > a  # เลข id ต่อจากข้อมูลเดิม
+    with pytest.raises(ValueError):
+        sv.import_backup(other, b'{"app": "other", "tables": {}}')
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("SPORTSDAY_TEST_PG"), reason="ตั้ง SPORTSDAY_TEST_PG เพื่อทดสอบกับ PostgreSQL")
+def test_backup_into_postgres(engine):
+    import os
+    from sqlalchemy import text
+    a, eid, sid = _fill_some(engine)
+    pg = make_engine(os.environ["SPORTSDAY_TEST_PG"])
+    with pg.begin() as c:  # เริ่มจากฐานข้อมูลว่าง
+        for t in reversed(__import__("sportsday.db", fromlist=["metadata"]).metadata.sorted_tables):
+            c.execute(text(f"DELETE FROM {t.name}"))
+    sv.seed_defaults(pg)
+    sv.seed_users(pg, "1234")
+    sv.import_backup(pg, sv.export_backup(engine))
+    assert sv.data_counts(pg) == sv.data_counts(engine)
+    assert sv.authenticate(pg, "kru1", "secret1")
+    new_id = sv.add_student(pg, code="x", prefix="", first_name="ใหม่", last_name="", gender="ชาย", grade=1, room=1)
+    assert new_id > a  # sequence ถูกตั้งต่อจากข้อมูลที่กู้คืน
+    sv.create_user(pg, "kru2", "secret2", "staff")
+    sv.create_daily_rounds(pg, date(2026, 11, 5), date(2026, 11, 5), [sv.color_id_by_name(pg, "ชมพู")])

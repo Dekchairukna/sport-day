@@ -8,7 +8,7 @@ import time
 import streamlit as st
 
 from . import services as sv
-from .db import make_engine, schema_signature
+from .db import local_db_path, make_engine, on_streamlit_cloud, schema_signature
 
 CSS = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -72,6 +72,23 @@ h1 { font-weight: 700 !important; } h2, h3, h4 { font-weight: 600 !important; }
 .score-card .big-num { font-size:3.4rem; line-height:1.2; font-weight:700; font-variant-numeric: tabular-nums; color: inherit; }
 .score-card .lbl { font-size:1.05rem; font-family: var(--f-display); font-weight: 500; }
 .muted { color: var(--muted); font-size:.9rem }
+.medals { display:flex; gap:8px; margin:8px 0 6px; flex-wrap:wrap; }
+.medals .m { font-family: var(--f-display); font-size: 2.2rem; font-weight: 700; line-height: 1.25; min-width: 3.4rem;
+             text-align: center; border-radius: 12px; padding: 2px 10px; font-variant-numeric: tabular-nums; }
+.medals .g { background: #fff1c1; color: #8a6206; } .medals .s { background: #eef0f4; color: #4b5563; }
+.medals .b { background: #fde2cf; color: #9a4a1c; }
+/* เช็คชื่อบนมือถือ: ปุ่มใหญ่กดง่าย สีตามสถานะ */
+[class*="st-key-attrow"] { gap: 4px; padding: 8px 0 10px; border-bottom: 1px solid var(--line); }
+[class*="st-key-attrow"] [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
+[class*="st-key-attrow"] p { margin: 0 !important; line-height: 1.7; }
+[class*="st-key-attrow"] [data-testid="stElementContainer"]:has([data-testid="stButtonGroup"]),
+[class*="st-key-attrow"] [data-testid="stButtonGroup"] { width: 100% !important; }
+[class*="st-key-attrow"] [data-testid="stButtonGroup"] [role="radiogroup"] { display: grid !important; grid-template-columns: repeat(4, 1fr); width: 100%; max-width: 460px; }
+[class*="st-key-attrow"] [data-testid="stButtonGroup"] button { min-height: 44px; font-size: 16px; font-weight: 600; justify-content: center; }
+[class*="st-key-attrow"] [data-testid="stButtonGroup"] button:nth-of-type(1)[kind$="Active"] { background: #cdeee4 !important; color: #1f6b5c !important; border-color: #6fbfae !important; }
+[class*="st-key-attrow"] [data-testid="stButtonGroup"] button:nth-of-type(2)[kind$="Active"] { background: #fff1c1 !important; color: #8a6206 !important; border-color: #e9c46a !important; }
+[class*="st-key-attrow"] [data-testid="stButtonGroup"] button:nth-of-type(3)[kind$="Active"] { background: #d4e8fb !important; color: #24578f !important; border-color: #8fbbe8 !important; }
+[class*="st-key-attrow"] [data-testid="stButtonGroup"] button:nth-of-type(4)[kind$="Active"] { background: #fbd3df !important; color: #a3324f !important; border-color: #ee9ab3 !important; }
 </style>
 """
 
@@ -187,9 +204,19 @@ def _role_text(engine, u: dict) -> str:
     return sv.ROLES[u["role"]]
 
 
+def storage_is_temporary(engine) -> bool:
+    """ใช้ไฟล์ SQLite บน Streamlit Cloud = ข้อมูลหายเมื่อแอปเริ่มใหม่"""
+    return engine.dialect.name == "sqlite" and on_streamlit_cloud()
+
+
 def sidebar_login(engine) -> None:
     with st.sidebar:
+        if msg := st.session_state.pop("bk_flash", None):  # หลังย้าย/กู้คืนข้อมูล ผู้ใช้ต้องเข้าสู่ระบบใหม่
+            st.success(msg + " · เข้าสู่ระบบใหม่ด้วยบัญชีเดิม")
         u = current_user()
+        if u and u["role"] == "admin" and storage_is_temporary(engine):
+            st.error("ข้อมูลบนเว็บนี้เก็บในไฟล์ชั่วคราว อาจหายเมื่อแอปเริ่มใหม่ "
+                     "ย้ายเข้าฐานข้อมูลถาวรได้ที่ ตั้งค่า → สำรองข้อมูล")
         if u:
             st.success(f"**{u['display_name'] or u['username']}**\n\n{_role_text(engine, u)} · {u['username']}")
             if st.session_state.get("weak_pw"):

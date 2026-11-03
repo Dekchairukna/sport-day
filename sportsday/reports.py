@@ -27,6 +27,8 @@ from sqlalchemy.engine import Engine
 from . import services as sv
 
 FONT_DIR = Path(__file__).resolve().parent / "fonts"
+# จัดรูปอักษรไทยด้วย HarfBuzz (uharfbuzz) ให้วรรณยุกต์ซ้อนสระบนถูกตำแหน่ง เช่น ที่ เพื่อ นี้
+ParagraphStyle.defaults["shaping"] = 1
 THAI_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."]
 THAI_DAYS = ["จ.", "อ.", "พ.", "พฤ.", "ศ.", "ส.", "อา."]
 
@@ -255,6 +257,190 @@ def sticker_pdf(engine: Engine, event_ids: list[int] | None = None, copies: int 
             p.drawOn(c, x + 4 * mm, cy)
     if not labels:
         c.setFont("Sarabun", 14)
-        c.drawString(20 * mm, A4[1] - 30 * mm, "ไม่มีรายการ")
+        c.drawString(20 * mm, A4[1] - 30 * mm, "ไม่มีรายการ", shaping=True)
     c.save()
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- เกียรติบัตร
+
+THAI_MONTHS_FULL = ["มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม",
+                    "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"]
+CERT_KINDS = {
+    "medal": "ผู้ได้รับเหรียญ (ชนะเลิศ / รองชนะเลิศ)",
+    "join": "เข้าร่วมการแข่งขัน",
+    "award": "นักกีฬายอดเยี่ยมและรางวัลพิเศษ",
+    "role": "ผู้ปฏิบัติหน้าที่ (ประธานสี ลีดเดอร์ ฯลฯ)",
+}
+
+
+def thai_full_date(d: date) -> str:
+    return f"{d.day} {THAI_MONTHS_FULL[d.month - 1]} พ.ศ. {d.year + 543}"
+
+
+def certificate_items(engine: Engine, kind: str, event_ids: list[int] | None = None, color: str | None = None,
+                      places: tuple[int, ...] = (1, 2, 3), role_names: list[str] | None = None) -> pd.DataFrame:
+    """รายชื่อที่จะได้เกียรติบัตร: name, klass, color, achievement, detail, student_id"""
+    cols = ["student_id", "name", "klass", "color", "achievement", "detail"]
+    if kind in ("medal", "join"):
+        ar = sv.athlete_results(engine)
+        ar = ar[ar["done"]] if not ar.empty else ar
+        if event_ids:
+            ar = ar[ar.event_id.isin(event_ids)]
+        if kind == "medal":
+            ar = ar[ar.place.isin(places)]
+            ach = ar["place"].map(lambda p: "ได้รับรางวัล" + sv.PLACE_TEXT[int(p)])
+        else:
+            ach = pd.Series("ได้เข้าร่วมการแข่งขัน", index=ar.index)
+        out = pd.DataFrame({"student_id": ar["student_id"], "name": ar["full_name"], "klass": ar["class"],
+                            "color": ar["color"], "achievement": ach,
+                            "detail": "ประเภท " + ar["event"].astype(str), "_d": ar["date"], "_p": ar.get("place")})
+        out = out.sort_values(["_d", "detail", "_p", "color", "klass", "name"]).drop(columns=["_d", "_p"])
+    elif kind == "award":
+        best = sv.best_athletes(engine)
+        a = sv.awards_df(engine)
+        a = a[~a["title"].isin(sv.BEST_TITLES.values())]  # นักกีฬายอดเยี่ยมใช้ผลที่ระบบคำนวณ
+        out = pd.concat([
+            pd.DataFrame({"student_id": best["student_id"], "name": best["full_name"], "klass": best["class"],
+                          "color": best["color"], "achievement": "ได้รับรางวัล" + best["title"],
+                          "detail": [f"ได้เหรียญรวม {r['รวมเหรียญ']} เหรียญ (ทอง {r['ทอง']} · เงิน {r['เงิน']} · ทองแดง {r['ทองแดง']})"
+                                     for r in best.to_dict("records")]}),
+            pd.DataFrame({"student_id": a["student_id"], "name": a["full_name"], "klass": a["class"],
+                          "color": a["color"], "achievement": "ได้รับรางวัล" + a["title"],
+                          "detail": a["note"].fillna("")}),
+        ], ignore_index=True)
+    elif kind == "role":
+        st = sv.students_df(engine)
+        rows = []
+        for r in st.to_dict("records"):
+            for role in r["roles"]:
+                if not role_names or role in role_names:
+                    rows.append((r["id"], r["full_name"], r["class"], r["color"], f"ได้ปฏิบัติหน้าที่{role}", ""))
+        out = pd.DataFrame(rows, columns=cols)
+    else:
+        raise ValueError(kind)
+    if color:
+        out = out[out["color"] == color]
+    return out[cols].reset_index(drop=True)
+
+
+def certificate_pdf(engine: Engine, items: pd.DataFrame, issue_date: date | None = None) -> bytes:
+    """เกียรติบัตร A4 แนวนอน หน้าละ 1 ใบ"""
+    import base64
+    from reportlab.lib.pagesizes import landscape
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    _register_fonts()
+    cfg = sv.cert_settings(engine)
+    title = sv.get_setting(engine, "event_title")
+    school = sv.get_setting(engine, "school_name")
+    date_text = cfg["date_text"] or f"ให้ไว้ ณ วันที่ {thai_full_date(issue_date or date.today())}"
+    logo = None
+    if cfg["logo"]:
+        try:
+            logo = ImageReader(io.BytesIO(base64.b64decode(cfg["logo"])))
+        except Exception:  # รูปเสีย ข้ามไป
+            logo = None
+    signers = [s for s in cfg["signers"] if s.get("name") or s.get("position")]
+
+    W, H = landscape(A4)
+    gold, ink, soft = rl_colors.HexColor("#b8902b"), rl_colors.HexColor("#2b2a33"), rl_colors.HexColor("#6e6a78")
+    teal = rl_colors.HexColor("#2f7a6b")
+
+    def para(text, size, bold=False, color=ink, leading=None):
+        return Paragraph(text, ParagraphStyle("c", fontName="Sarabun-Bold" if bold else "Sarabun", fontSize=size,
+                                              leading=leading or size * 1.45, alignment=TA_CENTER, textColor=color))
+
+    def center(c, p, y, width=W - 60 * mm):
+        _, h = p.wrap(width, 200)
+        p.drawOn(c, (W - width) / 2, y - h)
+        return y - h
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(W, H))
+    c.setTitle(f"เกียรติบัตร {title}")
+    for n, r in enumerate(items.itertuples(), 1):
+        # กรอบ
+        c.setStrokeColor(gold)
+        c.setLineWidth(3)
+        c.rect(10 * mm, 10 * mm, W - 20 * mm, H - 20 * mm)
+        c.setLineWidth(0.8)
+        c.rect(14 * mm, 14 * mm, W - 28 * mm, H - 28 * mm)
+        for x, y in [(14, 14), (W / mm - 14, 14), (14, H / mm - 14), (W / mm - 14, H / mm - 14)]:
+            c.setFillColor(gold)
+            c.circle(x * mm, y * mm, 2.2 * mm, stroke=0, fill=1)
+        if cfg["prefix"]:
+            c.setFont("Sarabun", 11)
+            c.setFillColor(soft)
+            c.drawRightString(W - 22 * mm, H - 22 * mm, f"เลขที่ {cfg['prefix']}{n}", shaping=True)
+
+        top = H - 18 * mm
+        if logo:
+            lh = 24 * mm
+            iw, ih = logo.getSize()
+            lw = lh * iw / ih
+            c.drawImage(logo, (W - lw) / 2, top - lh, lw, lh, mask="auto")
+            top -= lh + 2 * mm
+        sub = " · ".join(x for x in [f"ชั้น {r.klass}" if r.klass else "", f"สี{r.color}" if r.color else ""] if x)
+        block = [  # (ย่อหน้า, ระยะห่างก่อนหน้า มม.)
+            (para(school, 20, True), 0),
+            (para("เกียรติบัตร", 40, True, color=gold, leading=52), 0),
+            (para("ฉบับนี้ให้ไว้เพื่อแสดงว่า", 17, color=soft), 1),
+            (para(r.name, 32, True, leading=46), 3),
+            (para(sub, 16, color=soft), 0) if sub else None,
+            (para(r.achievement, 24, True, color=teal), 4),
+            (para(r.detail, 18), 0) if r.detail else None,
+            (para(f"ในการแข่งขัน{title}", 17), 2),
+            (para("ขอให้มีความสุข ความเจริญ และเป็นแบบอย่างที่ดีตลอดไป", 15, color=soft), 0),
+            (para(date_text, 15), 3),
+        ]
+        block = [b for b in block if b]
+        width = W - 60 * mm
+        sizes = [p.wrap(width, 300)[1] + gap * mm for p, gap in block]
+        bottom = (58 if signers else 24) * mm
+        y = top - max(0, (top - bottom - sum(sizes)) / 2)
+        for (p, gap), h in zip(block, sizes):
+            y -= h
+            p.drawOn(c, (W - width) / 2, y)
+
+        if signers:
+            slot = (W - 40 * mm) / len(signers)
+            base = 26 * mm
+            for i, s in enumerate(signers):
+                cx = 20 * mm + slot * i + slot / 2
+                c.setStrokeColor(soft)
+                c.setLineWidth(0.5)
+                c.setDash(1, 2)
+                c.line(cx - 32 * mm, base + 14 * mm, cx + 32 * mm, base + 14 * mm)
+                c.setDash()
+                for text, dy, size in [(f"({s['name']})" if s.get("name") else "", 8, 14),
+                                       (s.get("position", ""), 1, 13)]:
+                    if text:
+                        p = Paragraph(text, ParagraphStyle("s", fontName="Sarabun", fontSize=size, leading=size * 1.4,
+                                                           alignment=TA_CENTER, textColor=ink))
+                        _, h = p.wrap(80 * mm, 40)
+                        p.drawOn(c, cx - 40 * mm, base + dy * mm - h + size * 0.4)
+        c.showPage()
+    if items.empty:
+        c.setFont("Sarabun", 16)
+        c.drawString(30 * mm, H - 40 * mm, "ไม่มีรายชื่อตามที่เลือก", shaping=True)
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def certificate_register(items: pd.DataFrame, prefix: str = "") -> bytes:
+    """ทะเบียนคุมเกียรติบัตร (Excel) เลขที่ตรงกับไฟล์ PDF ชุดเดียวกัน"""
+    df = pd.DataFrame({
+        "เลขที่": [f"{prefix}{i}" for i in range(1, len(items) + 1)],
+        "ชื่อ-สกุล": items["name"], "ชั้น": items["klass"], "สี": items["color"],
+        "รางวัล": items["achievement"], "รายการ": items["detail"],
+    })
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, index=False, sheet_name="ทะเบียนเกียรติบัตร")
+        ws = xw.sheets["ทะเบียนเกียรติบัตร"]
+        for col, w in zip("ABCDEF", [14, 32, 10, 10, 34, 40]):
+            ws.column_dimensions[col].width = w
     return buf.getvalue()

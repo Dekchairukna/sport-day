@@ -116,6 +116,24 @@ results = Table(
     Column("recorded_at", DateTime, nullable=False),
 )
 
+placings = Table(  # อันดับ 2-3 (อันดับ 1 อยู่ในตาราง results) ใช้เมื่อมีมากกว่า 2 สี
+    "placings",
+    metadata,
+    Column("event_id", Integer, ForeignKey("events.id", ondelete="CASCADE"), primary_key=True),
+    Column("color_id", Integer, ForeignKey("colors.id"), primary_key=True),
+    Column("place", Integer, nullable=False),
+)
+
+awards = Table(  # รางวัลพิเศษ เช่น นักกีฬายอดเยี่ยมชาย/หญิง
+    "awards",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("title", String(200), nullable=False),
+    Column("student_id", Integer, ForeignKey("students.id", ondelete="CASCADE"), nullable=False),
+    Column("note", Text, nullable=False, default=""),
+    Column("created_at", DateTime, nullable=True),
+)
+
 trophies = Table(
     "trophies",
     metadata,
@@ -187,13 +205,22 @@ def schema_signature() -> tuple:
     return tuple((t.name, tuple(c.name for c in t.columns)) for t in metadata.sorted_tables)
 
 
+def local_db_path() -> Path:
+    """ไฟล์ฐานข้อมูลในเครื่อง (ใช้เมื่อไม่ได้ตั้ง db_url)"""
+    return Path(__file__).resolve().parent.parent / "data" / "sportsday.db"
+
+
+def on_streamlit_cloud() -> bool:
+    """Streamlit Community Cloud วางโค้ดไว้ที่ /mount/src · ไฟล์ในเครื่องที่นั่นหายเมื่อแอปเริ่มใหม่"""
+    return Path("/mount/src").exists()
+
+
 def default_url() -> str:
     url = os.environ.get("SPORTSDAY_DB_URL")
     if url:
         return url
-    data_dir = Path(__file__).resolve().parent.parent / "data"
-    data_dir.mkdir(exist_ok=True)
-    return f"sqlite:///{data_dir / 'sportsday.db'}"
+    local_db_path().parent.mkdir(exist_ok=True)
+    return f"sqlite:///{local_db_path()}"
 
 
 def make_engine(url: str | None = None) -> Engine:

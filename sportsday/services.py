@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import hmac
+import json
 import secrets
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -25,6 +26,12 @@ EVENT_GENDERS = ["ชาย", "หญิง", "ผสม"]
 LEVELS = {"ต้น": "ม.ต้น", "ปลาย": "ม.ปลาย", "รวม": "รวม"}
 ATT_STATUSES = ["มา", "สาย", "ลา", "ขาด"]
 DEFAULT_ACTIVITIES = ["เช็ครวมสี", "ซ้อมเชียร์", "ซ้อมขบวนพาเหรด", "ซ้อมกีฬา", "ก่อนแข่งขัน", "ประชุมสี"]
+# รอบประจำวันช่วงก่อนแข่ง (แก้ได้ที่ ตั้งค่า → กิจกรรมเช็คชื่อ)
+DEFAULT_DAILY_ROUNDS = [
+    {"slot": "เช้า", "activity": "ประชุมสี"},
+    {"slot": "สาย", "activity": "ซ้อมเชียร์"},
+    {"slot": "บ่าย", "activity": "ซ้อมเชียร์"},
+]
 TROPHY_STATUSES = ["รอเตรียม", "ติดสติ๊กเกอร์แล้ว", "ส่งครูฟ้าแล้ว"]
 ROLE_GROUPS = {"admin": "ฝ่ายบริหาร / สต๊าฟ", "cheer": "กองเชียร์"}
 
@@ -146,6 +153,7 @@ PERMS = {
     "colors": "จัดการหน้าสีได้ทุกสี",
     "move_color": "ย้ายสี",
     "settings": "ตั้งค่าระบบ",
+    "certificates": "เกียรติบัตรและนักกีฬายอดเยี่ยม",
 }
 DEFAULT_STAFF_PERMS = ["results", "schedule", "attendance", "trophies", "members", "colors"]
 # สิทธิ์ที่เปิดให้สต๊าฟสีได้ (เช็คชื่อเฉพาะสมาชิกในสีตัวเอง)
@@ -708,6 +716,7 @@ def set_result(engine: Engine, event_id: int, winner_color_id: int, score: str =
 
 def clear_result(engine: Engine, event_id: int) -> None:
     with engine.begin() as c:
+        c.execute(delete(db.placings).where(db.placings.c.event_id == event_id))
         c.execute(delete(db.results).where(db.results.c.event_id == event_id))
 
 
@@ -869,10 +878,11 @@ def sessions_df(engine: Engine) -> pd.DataFrame:
     s = db.att_sessions
     q = (select(s, db.activities.c.name.label("activity"))
          .select_from(s.outerjoin(db.activities, s.c.activity_id == db.activities.c.id))
-         .order_by(s.c.date.desc(), s.c.id.desc()))
+         .order_by(s.c.date.desc(), s.c.id))
     with engine.connect() as c:
         df = pd.read_sql(q, c)
     df["activity"] = df["activity"].fillna("ไม่ระบุกิจกรรม")
+    df["day"] = pd.to_datetime(df["date"]).dt.date
     return df
 
 
@@ -926,6 +936,81 @@ def _attendance_rows(engine: Engine, activity_id: int | None = None) -> pd.DataF
         return pd.read_sql(q, c)
 
 
+def set_attendance_one(engine: Engine, session_id: int, student_id: int, status: str | None) -> None:
+    """บันทึกสถานะของนักเรียนคนเดียว (กดปุ่มบนมือถือแล้วบันทึกทันที) · status ว่าง = ยกเลิกการเช็ค
+    หมายเหตุเดิมยังเก็บไว้"""
+    a = db.attendance.c
+    where = and_(a.session_id == session_id, a.student_id == student_id)
+    with engine.begin() as c:
+        old = c.execute(select(a.note).where(where)).scalar()
+        c.execute(delete(db.attendance).where(where))
+        if status in ATT_STATUSES:
+            c.execute(insert(db.attendance).values(session_id=session_id, student_id=student_id,
+                                                   status=status, note=old or ""))
+
+
+def mark_unchecked(engine: Engine, session_id: int, student_ids: Iterable[int], status: str = "มา") -> int:
+    """ใส่สถานะให้คนที่ยังไม่ได้เช็คในรายชื่อที่ส่งมา (ไม่ทับคนที่เช็คแล้ว)"""
+    a = db.attendance.c
+    with engine.begin() as c:
+        done = {r[0] for r in c.execute(select(a.student_id).where(a.session_id == session_id))}
+        rows = [{"session_id": session_id, "student_id": int(i), "status": status, "note": ""}
+                for i in student_ids if int(i) not in done]
+        if rows:
+            c.execute(insert(db.attendance), rows)
+    return len(rows)
+
+
+def get_daily_rounds(engine: Engine) -> list[dict]:
+    raw = get_setting(engine, "daily_rounds")
+    try:
+        rows = json.loads(raw) if raw else DEFAULT_DAILY_ROUNDS
+    except ValueError:
+        rows = DEFAULT_DAILY_ROUNDS
+    return [{"slot": str(r["slot"]).strip(), "activity": str(r["activity"]).strip()}
+            for r in rows if str(r.get("slot", "")).strip() and str(r.get("activity", "")).strip()]
+
+
+def set_daily_rounds(engine: Engine, rows: Iterable[dict]) -> list[dict]:
+    clean = [{"slot": str(r.get("slot") or "").strip(), "activity": str(r.get("activity") or "").strip()}
+             for r in rows]
+    clean = [r for r in clean if r["slot"] and r["activity"]]
+    if not clean:
+        raise ValueError("ต้องมีอย่างน้อย 1 รอบ")
+    if len({r["slot"] for r in clean}) != len(clean):
+        raise ValueError("ชื่อช่วงเวลาซ้ำกัน")
+    set_setting(engine, "daily_rounds", json.dumps(clean, ensure_ascii=False))
+    return clean
+
+
+def create_daily_rounds(engine: Engine, start: date, end: date, color_ids: Iterable[int]) -> tuple[int, int]:
+    """สร้างรอบประจำวัน (ทั้งสี) ทุกวันตั้งแต่ start ถึง end ให้แต่ละสี · รอบที่มีอยู่แล้วจะข้าม
+    คืน (สร้างใหม่, ข้าม)"""
+    if end < start:
+        start, end = end, start
+    if (end - start).days > 60:
+        raise ValueError("สร้างได้ครั้งละไม่เกิน 60 วัน")
+    rounds = get_daily_rounds(engine)
+    names = list_colors(engine).set_index("id")["name"].to_dict()
+    act_ids = {r["activity"]: add_activity(engine, r["activity"]) for r in rounds}
+    s = db.att_sessions.c
+    made = skipped = 0
+    with engine.begin() as c:
+        d = start
+        while d <= end:
+            for cid in color_ids:
+                for r in rounds:
+                    title = f"{r['slot']} (สี{names.get(cid, '')})"
+                    if c.execute(select(s.id).where(s.date == d, s.color_id == cid, s.title == title)).first():
+                        skipped += 1
+                        continue
+                    c.execute(insert(db.att_sessions).values(title=title, date=d, color_id=cid,
+                                                             activity_id=act_ids[r["activity"]]))
+                    made += 1
+            d += timedelta(days=1)
+    return made, skipped
+
+
 def attendance_summary(engine: Engine, activity_id: int | None = None) -> pd.DataFrame:
     """สรุปรายคน: มา/สาย/ลา/ขาด และร้อยละการมา (นับ สาย เป็นมา) · เลือกเฉพาะกิจกรรมได้"""
     att = _attendance_rows(engine, activity_id)
@@ -958,3 +1043,256 @@ def activity_overview(engine: Engine, color_id: int | None = None) -> pd.DataFra
                      "ขาด": int((a.status == "ขาด").sum()),
                      "ร้อยละมา": round(came / len(a) * 100) if len(a) else 0})
     return pd.DataFrame(rows, columns=["กิจกรรม", "จำนวนรอบ", "เช็คแล้ว (คน-ครั้ง)", "ขาด", "ร้อยละมา"])
+
+
+# ---------------------------------------------------------------- เหรียญ อันดับ และรางวัลพิเศษ
+
+MEDALS = {1: "ทอง", 2: "เงิน", 3: "ทองแดง"}
+PLACE_TEXT = {1: "ชนะเลิศ", 2: "รองชนะเลิศอันดับ 1", 3: "รองชนะเลิศอันดับ 2"}
+# นักกีฬายอดเยี่ยม: ระบบคำนวณเองจากจำนวนเหรียญรวม แยกชาย/หญิง
+BEST_TITLES = {"ชาย": "นักกีฬายอดเยี่ยมชาย", "หญิง": "นักกีฬายอดเยี่ยมหญิง"}
+# รางวัลพิเศษอื่นที่กรรมการเลือกเอง
+AWARD_TITLES = ["นักกีฬาดาวรุ่ง", "นักกีฬาน้ำใจนักกีฬา", "ผู้ฝึกสอนดีเด่น"]
+
+
+def set_places(engine: Engine, event_id: int, places: dict[int, int]) -> None:
+    """ตั้งอันดับ 2-3 ของรายการ {color_id: place} (อันดับ 1 ใช้ set_result)"""
+    with engine.begin() as c:
+        c.execute(delete(db.placings).where(db.placings.c.event_id == event_id))
+        rows = [{"event_id": event_id, "color_id": int(cid), "place": int(p)}
+                for cid, p in places.items() if p in (2, 3)]
+        if rows:
+            c.execute(insert(db.placings), rows)
+
+
+def event_places(engine: Engine) -> pd.DataFrame:
+    """อันดับของแต่ละสีในแต่ละรายการที่มีผลแล้ว: event_id, color_id, place
+    อันดับ 1 = สีที่ได้ถ้วย · อันดับ 2-3 ตามที่บันทึก · ถ้ามี 2 สี สีที่แพ้ได้อันดับ 2 อัตโนมัติ"""
+    with engine.connect() as c:
+        res = pd.read_sql(select(db.results.c.event_id, db.results.c.winner_color_id), c)
+        pl = pd.read_sql(select(db.placings), c)
+        ev = pd.read_sql(select(db.events.c.id).where(db.events.c.cancelled.is_(False)), c)
+    color_ids = list_colors(engine)["id"].tolist()
+    res = res[res.event_id.isin(ev.id)]
+    rows = []
+    for r in res.itertuples():
+        rows.append((r.event_id, r.winner_color_id, 1))
+        mine = pl[(pl.event_id == r.event_id) & (pl.color_id != r.winner_color_id)]
+        if not mine.empty:
+            rows += [(r.event_id, p.color_id, p.place) for p in mine.itertuples()]
+        elif len(color_ids) == 2:
+            rows += [(r.event_id, cid, 2) for cid in color_ids if cid != r.winner_color_id]
+    return pd.DataFrame(rows, columns=["event_id", "color_id", "place"]).astype(int)
+
+
+def medal_table(engine: Engine) -> pd.DataFrame:
+    """ตารางเหรียญรายสี เรียงแบบโอลิมปิก (ทอง > เงิน > ทองแดง)"""
+    cols = list_colors(engine)
+    pl = event_places(engine)
+    out = cols[["id", "name", "hex"]].copy()
+    for p, m in MEDALS.items():
+        out[m] = out["id"].map(pl[pl.place == p].groupby("color_id").size()).fillna(0).astype(int)
+    out["รวม"] = out[list(MEDALS.values())].sum(axis=1)
+    out = out.sort_values(["ทอง", "เงิน", "ทองแดง", "name"], ascending=[False, False, False, True]).reset_index(drop=True)
+    out.insert(0, "อันดับ", range(1, len(out) + 1))
+    return out
+
+
+def medal_by_sport(engine: Engine) -> pd.DataFrame:
+    ev = events_df(engine, include_cancelled=False)[["id", "sport"]]
+    pl = event_places(engine).merge(ev, left_on="event_id", right_on="id")
+    names = list_colors(engine).set_index("id")["name"]
+    rows = []
+    for sport in dict.fromkeys(ev["sport"]):
+        g = pl[pl.sport == sport]
+        row = {"ชนิดกีฬา": sport}
+        for cid, cname in names.items():
+            mine = g[g.color_id == cid]
+            row[f"สี{cname}"] = " ".join(f"{m} {int((mine.place == p).sum())}"
+                                        for p, m in MEDALS.items() if (mine.place == p).any()) or "-"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def athlete_results(engine: Engine) -> pd.DataFrame:
+    """ผลรายนักกีฬารายรายการ: นักกีฬา + รายการ + สีที่ลงแข่ง + อันดับ (ว่าง = เข้าร่วม/ยังไม่มีผล)"""
+    en = entries_df(engine)
+    if en.empty:
+        return pd.DataFrame(columns=["event_id", "student_id", "full_name", "class", "gender", "grade", "color",
+                                     "color_id", "event", "sport", "label", "date", "place"])
+    with engine.connect() as c:
+        ec = pd.read_sql(select(db.entries.c.event_id, db.entries.c.student_id, db.entries.c.color_id), c)
+    en = en.merge(ec, on=["event_id", "student_id"])
+    ev = events_df(engine, include_cancelled=False)[["id", "name", "sport", "label", "date", "winner"]]
+    df = en.merge(ev, left_on="event_id", right_on="id").drop(columns="id").rename(columns={"name": "event"})
+    pl = event_places(engine)
+    df = df.merge(pl, on=["event_id", "color_id"], how="left")
+    df["done"] = df["winner"].notna()
+    return df
+
+
+def athlete_leaderboard(engine: Engine) -> pd.DataFrame:
+    """จัดอันดับนักกีฬา: เหรียญรวมมากสุด > ทอง > เงิน > ทองแดง > จำนวนรายการที่ลง"""
+    ar = athlete_results(engine)
+    cols = ["student_id", "full_name", "class", "gender", "grade", "color", "รวมเหรียญ", "ทอง", "เงิน", "ทองแดง",
+            "รายการที่ลง", "รายการที่ชนะ"]
+    if ar.empty:
+        return pd.DataFrame(columns=cols)
+    g = ar.groupby("student_id")
+    out = g[["full_name", "class", "gender", "grade", "color"]].first()
+    for p, m in MEDALS.items():
+        out[m] = g["place"].apply(lambda s, p=p: int((s == p).sum()))
+    out["รวมเหรียญ"] = out["ทอง"] + out["เงิน"] + out["ทองแดง"]
+    out["รายการที่ลง"] = g.size()
+    out["รายการที่ชนะ"] = g.apply(lambda d: ", ".join(d.loc[d.place == 1, "event"]), include_groups=False)
+    out = out.reset_index().sort_values(["รวมเหรียญ", "ทอง", "เงิน", "ทองแดง", "รายการที่ลง", "full_name"],
+                                        ascending=[False, False, False, False, False, True])
+    return out[cols].reset_index(drop=True)
+
+
+def best_athletes(engine: Engine) -> pd.DataFrame:
+    """นักกีฬายอดเยี่ยมชาย/หญิง = เหรียญรวมมากที่สุดของแต่ละเพศ
+    เท่ากันตัดสินด้วย ทอง > เงิน > ทองแดง · ถ้ายังเท่ากันทุกอย่าง ได้รางวัลร่วม"""
+    lb = athlete_leaderboard(engine)
+    key = ["รวมเหรียญ", "ทอง", "เงิน", "ทองแดง"]
+    rows = []
+    for gender, title in BEST_TITLES.items():
+        g = lb[(lb.gender == gender) & (lb["รวมเหรียญ"] > 0)]
+        if g.empty:
+            continue
+        top = tuple(g.iloc[0][key])
+        win = g[g[key].apply(tuple, axis=1) == top].copy()
+        win.insert(0, "title", title)
+        win["tie"] = len(win) > 1
+        rows.append(win)
+    cols = ["title"] + list(lb.columns) + ["tie"]
+    return pd.concat(rows, ignore_index=True)[cols] if rows else pd.DataFrame(columns=cols)
+
+
+def awards_df(engine: Engine) -> pd.DataFrame:
+    with engine.connect() as c:
+        a = pd.read_sql(select(db.awards).order_by(db.awards.c.id), c)
+    st = students_df(engine, include_inactive=True)[["id", "full_name", "class", "color"]]
+    return a.merge(st, left_on="student_id", right_on="id", how="left", suffixes=("", "_s")).drop(columns="id_s")
+
+
+def add_award(engine: Engine, title: str, student_id: int, note: str = "") -> int:
+    title = " ".join(title.split())
+    if not title:
+        raise ValueError("ใส่ชื่อรางวัลก่อน")
+    with engine.begin() as c:
+        if c.execute(select(db.awards.c.id).where(db.awards.c.title == title,
+                                                   db.awards.c.student_id == student_id)).first():
+            raise ValueError("นักเรียนคนนี้ได้รางวัลนี้แล้ว")
+        return c.execute(insert(db.awards).values(title=title, student_id=student_id, note=note.strip(),
+                                                  created_at=datetime.now())).inserted_primary_key[0]
+
+
+def delete_award(engine: Engine, award_id: int) -> None:
+    with engine.begin() as c:
+        c.execute(delete(db.awards).where(db.awards.c.id == award_id))
+
+
+# ---------------------------------------------------------------- ตั้งค่าเกียรติบัตร
+
+DEFAULT_SIGNERS = [{"name": "", "position": "ผู้อำนวยการโรงเรียน"}]
+
+
+def cert_settings(engine: Engine) -> dict:
+    try:
+        signers = json.loads(get_setting(engine, "cert_signers") or "null") or DEFAULT_SIGNERS
+    except ValueError:
+        signers = DEFAULT_SIGNERS
+    return {
+        "signers": signers,
+        "date_text": get_setting(engine, "cert_date_text"),
+        "prefix": get_setting(engine, "cert_prefix"),
+        "logo": get_setting(engine, "cert_logo"),  # base64
+    }
+
+
+def save_cert_settings(engine: Engine, signers: list[dict], date_text: str, prefix: str) -> None:
+    clean = [{"name": str(s.get("name") or "").strip(), "position": str(s.get("position") or "").strip()}
+             for s in signers]
+    clean = [s for s in clean if s["name"] or s["position"]][:3]
+    set_setting(engine, "cert_signers", json.dumps(clean, ensure_ascii=False))
+    set_setting(engine, "cert_date_text", date_text.strip())
+    set_setting(engine, "cert_prefix", prefix.strip())
+
+
+# ---------------------------------------------------------------- สำรองและย้ายข้อมูล
+
+BACKUP_VERSION = 1
+
+
+def _jsonable(v):
+    if isinstance(v, (datetime, date)):
+        return v.isoformat()
+    return v
+
+
+def export_backup(engine: Engine) -> bytes:
+    """สำรองข้อมูลทุกตาราง (รวมผู้ใช้และรหัสผ่านแบบเข้ารหัส) เป็น JSON"""
+    out = {"app": "sportsday", "version": BACKUP_VERSION, "created_at": datetime.now().isoformat(), "tables": {}}
+    with engine.connect() as c:
+        for t in db.metadata.sorted_tables:
+            rows = c.execute(select(t)).mappings().all()
+            out["tables"][t.name] = [{k: _jsonable(v) for k, v in r.items()} for r in rows]
+    return json.dumps(out, ensure_ascii=False).encode("utf-8")
+
+
+def backup_summary(data: bytes) -> dict[str, int]:
+    """จำนวนแถวของแต่ละตารางในไฟล์สำรอง (ใช้แสดงก่อนกู้คืน)"""
+    obj = json.loads(data.decode("utf-8"))
+    if obj.get("app") != "sportsday":
+        raise ValueError("ไม่ใช่ไฟล์สำรองของระบบกีฬาสี")
+    return {k: len(v) for k, v in obj["tables"].items()}
+
+
+def _convert(table, row: dict) -> dict:
+    from sqlalchemy import Date, DateTime
+    out = {}
+    for k, v in row.items():
+        if k not in table.c:
+            continue  # คอลัมน์ที่เลิกใช้แล้ว
+        col = table.c[k]
+        if isinstance(v, str) and isinstance(col.type, DateTime):
+            v = datetime.fromisoformat(v)
+        elif isinstance(v, str) and isinstance(col.type, Date):
+            v = date.fromisoformat(v[:10])
+        out[k] = v
+    return out
+
+
+def import_backup(engine: Engine, data: bytes) -> dict[str, int]:
+    """แทนที่ข้อมูลทั้งหมดด้วยไฟล์สำรอง (ทำในทรานแซกชันเดียว ถ้าพังกลางทางข้อมูลเดิมไม่เปลี่ยน)"""
+    from sqlalchemy import text
+    obj = json.loads(data.decode("utf-8"))
+    if obj.get("app") != "sportsday":
+        raise ValueError("ไม่ใช่ไฟล์สำรองของระบบกีฬาสี")
+    tables = obj["tables"]
+    counts = {}
+    with engine.begin() as c:
+        for t in reversed(db.metadata.sorted_tables):
+            c.execute(delete(t))
+        for t in db.metadata.sorted_tables:
+            rows = [_convert(t, r) for r in tables.get(t.name, [])]
+            if rows:
+                c.execute(insert(t), rows)
+            counts[t.name] = len(rows)
+        if engine.dialect.name == "postgresql":  # ให้เลข id ถัดไปต่อจากข้อมูลที่ใส่
+            for t in db.metadata.sorted_tables:
+                if "id" in t.c and t.c["id"].primary_key:
+                    c.execute(text(f"SELECT setval(pg_get_serial_sequence('{t.name}', 'id'), "
+                                   f"COALESCE((SELECT MAX(id) FROM {t.name}), 0) + 1, false)"))
+    return counts
+
+
+def storage_kind(engine: Engine) -> str:
+    """postgresql = ฐานข้อมูลถาวร · sqlite = ไฟล์"""
+    return engine.dialect.name
+
+
+def data_counts(engine: Engine) -> dict[str, int]:
+    with engine.connect() as c:
+        return {t.name: c.execute(select(func.count()).select_from(t)).scalar() for t in db.metadata.sorted_tables}
