@@ -964,17 +964,36 @@ def session_roster(engine: Engine, session_id: int) -> pd.DataFrame:
     return st.reset_index(drop=True)
 
 
-def save_attendance(engine: Engine, session_id: int, rows: Iterable[dict]) -> int:
+def _log(c, session_id: int, changes: list[tuple[int, str, str]], by: str) -> None:
+    """บันทึกประวัติ (student_id, เดิม, ใหม่) เฉพาะที่เปลี่ยนจริง"""
+    now = datetime.now()
+    rows = [{"session_id": session_id, "student_id": int(sid), "old_status": old or "", "new_status": new or "",
+             "by_name": (by or "")[:100], "at": now} for sid, old, new in changes if (old or "") != (new or "")]
+    if rows:
+        c.execute(insert(db.attendance_log), rows)
+
+
+def _current_status(c, session_id: int) -> dict[int, str]:
+    a = db.attendance.c
+    return {r.student_id: r.status for r in c.execute(select(a.student_id, a.status).where(a.session_id == session_id))}
+
+
+def save_attendance(engine: Engine, session_id: int, rows: Iterable[dict], by: str = "") -> int:
     n = 0
     with engine.begin() as c:
+        before = _current_status(c, session_id)
+        changes = []
         for r in rows:
             sid = int(r["student_id"])
             c.execute(delete(db.attendance).where(and_(db.attendance.c.session_id == session_id,
                                                        db.attendance.c.student_id == sid)))
-            if r.get("status") in ATT_STATUSES:
+            new = r.get("status") if r.get("status") in ATT_STATUSES else ""
+            if new:
                 c.execute(insert(db.attendance).values(session_id=session_id, student_id=sid,
-                                                       status=r["status"], note=(r.get("note") or "").strip()))
+                                                       status=new, note=(r.get("note") or "").strip()))
                 n += 1
+            changes.append((sid, before.get(sid, ""), new))
+        _log(c, session_id, changes, by)
     return n
 
 
@@ -988,20 +1007,22 @@ def _attendance_rows(engine: Engine, activity_id: int | None = None) -> pd.DataF
         return pd.read_sql(q, c)
 
 
-def set_attendance_one(engine: Engine, session_id: int, student_id: int, status: str | None) -> None:
+def set_attendance_one(engine: Engine, session_id: int, student_id: int, status: str | None, by: str = "") -> None:
     """บันทึกสถานะของนักเรียนคนเดียว (กดปุ่มบนมือถือแล้วบันทึกทันที) · status ว่าง = ยกเลิกการเช็ค
-    หมายเหตุเดิมยังเก็บไว้"""
+    หมายเหตุเดิมยังเก็บไว้ · เก็บประวัติการเปลี่ยน"""
     a = db.attendance.c
     where = and_(a.session_id == session_id, a.student_id == student_id)
     with engine.begin() as c:
-        old = c.execute(select(a.note).where(where)).scalar()
+        old = c.execute(select(a.status, a.note).where(where)).first()
         c.execute(delete(db.attendance).where(where))
-        if status in ATT_STATUSES:
+        new = status if status in ATT_STATUSES else ""
+        if new:
             c.execute(insert(db.attendance).values(session_id=session_id, student_id=student_id,
-                                                   status=status, note=old or ""))
+                                                   status=new, note=(old.note if old else "") or ""))
+        _log(c, session_id, [(student_id, old.status if old else "", new)], by)
 
 
-def mark_unchecked(engine: Engine, session_id: int, student_ids: Iterable[int], status: str = "มา") -> int:
+def mark_unchecked(engine: Engine, session_id: int, student_ids: Iterable[int], status: str = "มา", by: str = "") -> int:
     """ใส่สถานะให้คนที่ยังไม่ได้เช็คในรายชื่อที่ส่งมา (ไม่ทับคนที่เช็คแล้ว)"""
     a = db.attendance.c
     with engine.begin() as c:
@@ -1010,7 +1031,73 @@ def mark_unchecked(engine: Engine, session_id: int, student_ids: Iterable[int], 
                 for i in student_ids if int(i) not in done]
         if rows:
             c.execute(insert(db.attendance), rows)
+        _log(c, session_id, [(r["student_id"], "", status) for r in rows], by)
     return len(rows)
+
+
+def move_attendance(engine: Engine, src: int, dst: int, overwrite: bool = True, delete_src: bool = False,
+                    by: str = "") -> int:
+    """ย้ายผลเช็คชื่อจากรอบ src ไปรอบ dst (เช่น เด็กกรอกผิดรอบ)
+    overwrite=True: ทับคนที่รอบปลายทางเช็คแล้ว · False: ใส่เฉพาะคนที่ปลายทางยังว่าง · delete_src: ลบรอบต้นทางทิ้ง"""
+    if src == dst:
+        raise ValueError("เลือกรอบปลายทางที่ไม่ใช่รอบเดิม")
+    a = db.attendance.c
+    with engine.begin() as c:
+        rows = c.execute(select(db.attendance).where(a.session_id == src)).mappings().all()
+        before = {r.student_id: r for r in c.execute(select(db.attendance).where(a.session_id == dst))}
+        moved, changes = 0, []
+        for r in rows:
+            sid = r["student_id"]
+            if sid in before and not overwrite:
+                continue
+            c.execute(delete(db.attendance).where(and_(a.session_id == dst, a.student_id == sid)))
+            c.execute(insert(db.attendance).values(session_id=dst, student_id=sid, status=r["status"],
+                                                   note=r["note"] or ""))
+            changes.append((sid, before[sid].status if sid in before else "", r["status"]))
+            moved += 1
+        _log(c, dst, changes, by or "ย้ายจากรอบอื่น")
+        if delete_src:
+            c.execute(delete(db.att_sessions).where(db.att_sessions.c.id == src))
+    return moved
+
+
+def attendance_history(engine: Engine, session_id: int) -> pd.DataFrame:
+    """ประวัติการเปลี่ยนผลเช็คชื่อของรอบ ล่าสุดก่อน"""
+    with engine.connect() as c:
+        log = pd.read_sql(select(db.attendance_log).where(db.attendance_log.c.session_id == session_id)
+                          .order_by(db.attendance_log.c.id.desc()), c)
+    st = students_df(engine, include_inactive=True)[["id", "full_name", "class"]]
+    return log.merge(st, left_on="student_id", right_on="id", how="left", suffixes=("", "_s"))
+
+
+def round_compare(engine: Engine, other: Engine, other_sid: int, sid: int) -> dict:
+    """เทียบผลเช็คชื่อรอบ other_sid (ในอีกฐานข้อมูล เช่น ไฟล์เดิม) กับรอบ sid ตอนนี้"""
+    a = db.attendance.c
+    with other.connect() as c:
+        theirs = {r.student_id: r.status for r in c.execute(select(a.student_id, a.status).where(a.session_id == other_sid))}
+    with engine.connect() as c:
+        mine = _current_status(c, sid)
+    differ = sum(1 for k in set(theirs) | set(mine) if theirs.get(k, "") != mine.get(k, ""))
+    return {"in_file": len(theirs), "now": len(mine), "differ": differ}
+
+
+def restore_round(engine: Engine, other: Engine, other_sid: int, sid: int, by: str = "") -> int:
+    """แทนที่ผลเช็คชื่อรอบ sid ด้วยผลของรอบ other_sid จากอีกฐานข้อมูล (เช่น ไฟล์เดิมบนเซิร์ฟเวอร์)"""
+    a = db.attendance.c
+    with other.connect() as c:
+        rows = c.execute(select(db.attendance).where(a.session_id == other_sid)).mappings().all()
+    with engine.begin() as c:
+        exists = {r[0] for r in c.execute(select(db.students.c.id))}
+        before = _current_status(c, sid)
+        c.execute(delete(db.attendance).where(a.session_id == sid))
+        keep = [r for r in rows if r["student_id"] in exists]
+        if keep:
+            c.execute(insert(db.attendance), [{"session_id": sid, "student_id": r["student_id"], "status": r["status"],
+                                               "note": r["note"] or ""} for r in keep])
+        after = {r["student_id"]: r["status"] for r in keep}
+        _log(c, sid, [(k, before.get(k, ""), after.get(k, "")) for k in set(before) | set(after)],
+             by or "กู้จากไฟล์เดิม")
+    return len(keep)
 
 
 def get_daily_rounds(engine: Engine) -> list[dict]:
@@ -1350,5 +1437,8 @@ def storage_kind(engine: Engine) -> str:
 
 
 def data_counts(engine: Engine) -> dict[str, int]:
+    from sqlalchemy import inspect
+    have = set(inspect(engine).get_table_names())
     with engine.connect() as c:
-        return {t.name: c.execute(select(func.count()).select_from(t)).scalar() for t in db.metadata.sorted_tables}
+        return {t.name: c.execute(select(func.count()).select_from(t)).scalar() if t.name in have else 0
+                for t in db.metadata.sorted_tables}

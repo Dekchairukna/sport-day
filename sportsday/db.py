@@ -172,6 +172,18 @@ attendance = Table(
     Column("note", Text, nullable=False, default=""),
 )
 
+attendance_log = Table(  # ประวัติการเปลี่ยนผลเช็คชื่อ (ไม่ผูก FK เพื่อให้ประวัติอยู่แม้ลบรอบ)
+    "attendance_log",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("session_id", Integer, nullable=False),
+    Column("student_id", Integer, nullable=False),
+    Column("old_status", String(10), nullable=False, default=""),
+    Column("new_status", String(10), nullable=False, default=""),
+    Column("by_name", String(100), nullable=False, default=""),
+    Column("at", DateTime, nullable=False),
+)
+
 color_moves = Table(
     "color_moves",
     metadata,

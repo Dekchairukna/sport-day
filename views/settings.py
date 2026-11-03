@@ -171,22 +171,61 @@ if tab_backup:
         if engine.dialect.name == "postgresql" and legacy.exists():
             st.markdown("#### ย้ายข้อมูลจากไฟล์เดิมบนเซิร์ฟเวอร์")
             try:
-                old = create_engine(f"sqlite:///{legacy}")
+                from sportsday.db import make_engine as _open
+                old = _open(f"sqlite:///{legacy}")  # เปิดแบบเติมตาราง/คอลัมน์ที่ขาด (ไฟล์เดิมอาจเป็นโครงสร้างรุ่นเก่า)
                 old_counts = sv.data_counts(old)
             except Exception:  # ไฟล์เดิมเปิดไม่ได้หรือโครงสร้างเก่าเกินไป
                 old, old_counts = None, {}
             if old is not None and old_counts.get("students", 0):
                 st.caption("พบข้อมูลในไฟล์เดิม: " + show_counts(old_counts))
-                st.warning("ข้อมูลในฐานข้อมูลถาวรตอนนี้จะถูกแทนที่ด้วยข้อมูลจากไฟล์เดิมทั้งหมด")
-                ok = st.checkbox("ยืนยันการย้ายข้อมูล", key="bk_mig_ok")
-                if st.button("ย้ายข้อมูลจากไฟล์เดิมเข้าฐานข้อมูลถาวร", type="primary", disabled=not ok, key="bk_mig"):
-                    from sportsday.db import make_engine
-                    counts = sv.import_backup(engine, sv.export_backup(make_engine(f"sqlite:///{legacy}")))
-                    st.session_state.clear()  # ผู้ใช้ชุดใหม่: เข้าสู่ระบบใหม่ด้วยบัญชีเดิมบนเว็บ
-                    st.session_state["bk_flash"] = "ย้ายแล้ว: " + show_counts(counts)
-                    st.rerun()
+                already = sv.data_counts(engine).get("students", 0) > 0
+                box = st.expander("ย้ายซ้ำทั้งหมด (ระวัง: ทับข้อมูลที่กรอกหลังย้ายแล้ว)") if already else st.container()
+                with box:
+                    if already:
+                        st.error("ฐานข้อมูลถาวรมีข้อมูลแล้ว ถ้าย้ายซ้ำ ข้อมูลที่กรอกหลังจากย้ายครั้งก่อนจะหายทั้งหมด "
+                                 "ถ้าต้องการแก้เฉพาะบางรอบ ใช้ ดึงผลเช็คชื่อรอบเดียว ด้านล่างแทน")
+                    else:
+                        st.warning("ข้อมูลในฐานข้อมูลถาวรตอนนี้จะถูกแทนที่ด้วยข้อมูลจากไฟล์เดิมทั้งหมด")
+                    ok = st.checkbox("ยืนยันการย้ายข้อมูล", key="bk_mig_ok")
+                    if st.button("ย้ายข้อมูลจากไฟล์เดิมเข้าฐานข้อมูลถาวร", type="primary", disabled=not ok, key="bk_mig"):
+                        counts = sv.import_backup(engine, sv.export_backup(old))
+                        st.session_state.clear()  # ผู้ใช้ชุดใหม่: เข้าสู่ระบบใหม่ด้วยบัญชีเดิมบนเว็บ
+                        st.session_state["bk_flash"] = "ย้ายแล้ว: " + show_counts(counts)
+                        st.rerun()
             else:
                 st.caption("ไม่พบข้อมูลในไฟล์เดิม (ไฟล์อาจหายไปแล้วเพราะแอปเริ่มใหม่) ใช้การกู้คืนจากไฟล์สำรองด้านล่างแทน")
+
+            if old is not None and old_counts.get("att_sessions", 0):
+                st.markdown("#### ดึงผลเช็คชื่อรอบเดียวจากไฟล์เดิม")
+                st.caption("ใช้เมื่อผลเช็คชื่อรอบใดรอบหนึ่งถูกกดทับหรือหาย · แทนที่เฉพาะรอบที่เลือก รอบอื่นไม่เปลี่ยน")
+                old_eng = old
+                sv.clear_cache()
+                old_ses = sv.sessions_df(old_eng)
+                sv.clear_cache()
+                cur_ses = sv.sessions_df(engine)
+                with old_eng.connect() as _c:
+                    from sqlalchemy import func as _f, select as _s
+                    from sportsday import db as _db
+                    cnt = dict(_c.execute(_s(_db.attendance.c.session_id, _f.count()).group_by(_db.attendance.c.session_id)).all())
+                lab = lambda df: df["day"].map(lambda d: d.strftime("%d/%m")) + " · " + df["title"] + " · " + df["activity"]
+                o_opts = dict(zip(old_ses["id"], lab(old_ses) + old_ses["id"].map(lambda i: f"  ({cnt.get(i, 0)} คน)")))
+                c_opts = dict(zip(cur_ses["id"], lab(cur_ses)))
+                if not c_opts:
+                    st.caption("ฐานข้อมูลตอนนี้ยังไม่มีรอบเช็คชื่อ ย้ายข้อมูลทั้งหมดก่อน")
+                else:
+                    osid = st.selectbox("รอบในไฟล์เดิม", list(o_opts), format_func=o_opts.get, key="rr_old")
+                    o = old_ses.set_index("id").loc[osid]
+                    match = cur_ses[(cur_ses["day"] == o["day"]) & (cur_ses["title"] == o["title"])
+                                    & (cur_ses["color_id"].fillna(0) == (o["color_id"] if pd.notna(o["color_id"]) else 0))]
+                    ids = list(c_opts)
+                    default = ids.index(int(match.iloc[0]["id"])) if not match.empty else 0
+                    csid = st.selectbox("ใส่ลงรอบตอนนี้", ids, index=default, format_func=c_opts.get, key=f"rr_cur_{osid}")
+                    cmp_ = sv.round_compare(engine, old_eng, int(osid), int(csid))
+                    st.caption(f"ในไฟล์เดิม {cmp_['in_file']} คน · ตอนนี้ {cmp_['now']} คน · ต่างกัน {cmp_['differ']} คน")
+                    ok = st.checkbox("ยืนยันแทนที่ผลเช็คชื่อรอบนี้ด้วยข้อมูลจากไฟล์เดิม", key="rr_ok")
+                    if st.button("ดึงผลรอบนี้กลับมา", type="primary", disabled=not ok or cmp_["differ"] == 0, key="rr_go"):
+                        n = sv.restore_round(engine, old_eng, int(osid), int(csid), by=ui.editor_name())
+                        st.success(f"ดึงกลับมาแล้ว {n} คน")
 
         st.markdown("#### กู้คืนจากไฟล์สำรอง")
         up = st.file_uploader("เลือกไฟล์สำรอง (.json)", type=["json"], key="bk_up")

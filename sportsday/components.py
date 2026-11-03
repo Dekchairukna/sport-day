@@ -257,6 +257,8 @@ def attendance_panel(engine, key: str, color_id: int | None = None) -> None:
             st.success(msg)
 
     with tab_check:
+        if msg := st.session_state.pop(f"{key}_mv_flash", None):
+            st.success(msg)
         if ses.empty:
             st.info("ยังไม่มีรอบเช็คชื่อ")
             daily_rounds_form(engine, f"{key}_quick", color_id, compact=True)
@@ -286,7 +288,7 @@ def attendance_panel(engine, key: str, color_id: int | None = None) -> None:
             sid = int(st.radio("รอบ", ids, index=idx, format_func=labels.get, horizontal=True,
                                key=f"{key}_round_{day}_{ids[idx]}"))
             st.session_state[pick_key] = sid
-            checklist(engine, key, sid)
+            checklist(engine, key, sid, color_id)
 
     with tab_sum:
         st.markdown("#### แยกตามกิจกรรม")
@@ -353,7 +355,7 @@ def daily_rounds_form(engine, key: str, color_id: int | None, compact: bool = Fa
 
 
 @st.fragment
-def checklist(engine, key: str, sid: int) -> None:
+def checklist(engine, key: str, sid: int, color_id: int | None = None) -> None:
     """เช็คชื่อแบบกดปุ่มรายคน ใช้บนมือถือได้ · กดแล้วบันทึกทันที
     เป็น fragment: กดปุ่มแล้วรันใหม่เฉพาะส่วนนี้ ไม่ต้องโหลดทั้งหน้า (เร็วขึ้นมากเมื่อฐานข้อมูลอยู่ไกล)"""
     roster = sv.session_roster(engine, sid)
@@ -386,12 +388,12 @@ def checklist(engine, key: str, sid: int) -> None:
     left = view[view["status"] == ""]
     if len(left) and st.button(f"มาทั้งหมด ({len(left)} คนที่ยังไม่เช็คในรายชื่อด้านล่าง)", key=f"{key}_all_{sid}",
                                width="stretch"):
-        sv.mark_unchecked(engine, sid, left["student_id"])
+        sv.mark_unchecked(engine, sid, left["student_id"], by=ui.editor_name())
         st.session_state[ver_key] = ver + 1
         st.rerun(scope="fragment")
 
     def save(student_id: int, wkey: str) -> None:
-        sv.set_attendance_one(engine, sid, student_id, st.session_state.get(wkey))
+        sv.set_attendance_one(engine, sid, student_id, st.session_state.get(wkey), by=ui.editor_name())
 
     if view.empty:
         st.caption("ไม่มีรายชื่อตามที่กรอง")
@@ -414,9 +416,39 @@ def checklist(engine, key: str, sid: int) -> None:
             },
         )
         if st.button("บันทึกตาราง", type="primary", key=f"{key}_save_{sid}"):
-            sv.save_attendance(engine, sid, out.to_dict("records"))
+            sv.save_attendance(engine, sid, out.to_dict("records"), by=ui.editor_name())
             st.session_state[ver_key] = ver + 1
             st.rerun(scope="fragment")
+    with st.expander("ย้ายผลเช็คชื่อรอบนี้ไปรอบอื่น (กรณีกรอกผิดรอบ)"):
+        ses = sv.sessions_df(engine)
+        if color_id is not None:
+            ses = ses[ses.color_id == color_id]
+        ses = ses[ses.id != sid]
+        if ses.empty:
+            st.caption("ไม่มีรอบอื่นให้ย้ายไป")
+        else:
+            opts = dict(zip(ses["id"], ses["day"].map(lambda d: thai_date(d, False)) + " · " + ses["title"]
+                            + " · " + ses["activity"]))
+            dst = st.selectbox("ย้ายไปรอบ", list(opts), format_func=opts.get, key=f"{key}_mv_dst_{sid}")
+            mode = st.radio("ถ้ารอบปลายทางมีคนเช็คแล้ว", ["เขียนทับด้วยผลจากรอบนี้", "ใส่เฉพาะคนที่ยังไม่ได้เช็ค"],
+                            key=f"{key}_mv_mode_{sid}")
+            drop = st.checkbox("ลบรอบนี้ทิ้งหลังย้ายเสร็จ", value=True, key=f"{key}_mv_drop_{sid}")
+            ok = st.checkbox("ยืนยันการย้าย", key=f"{key}_mv_ok_{sid}")
+            if st.button("ย้ายผลเช็คชื่อ", type="primary", disabled=not ok, key=f"{key}_mv_go_{sid}"):
+                n = sv.move_attendance(engine, sid, int(dst), overwrite=mode.startswith("เขียนทับ"), delete_src=drop,
+                                       by=ui.editor_name())
+                st.session_state[f"{key}_session"] = int(dst)
+                st.session_state[f"{key}_mv_flash"] = f"ย้ายผลเช็คชื่อแล้ว {n} คน ไปที่รอบ {opts[dst]}"
+                st.rerun()
+    with st.expander("ประวัติการแก้ไขรอบนี้"):
+        h = sv.attendance_history(engine, sid)
+        if h.empty:
+            st.caption("ยังไม่มีประวัติ (เริ่มเก็บตั้งแต่อัปเดตนี้)")
+        else:
+            st.dataframe(pd.DataFrame({
+                "เวลา": pd.to_datetime(h["at"]).dt.strftime("%d/%m %H:%M"), "ชื่อ-สกุล": h["full_name"],
+                "เดิม": h["old_status"].replace("", "-"), "เปลี่ยนเป็น": h["new_status"].replace("", "-"),
+                "โดย": h["by_name"]}), hide_index=True, width="stretch", height=300)
     with st.expander("ลบรอบนี้"):
         if st.checkbox("ยืนยันการลบรอบและผลเช็คชื่อทั้งหมดของรอบนี้", key=f"{key}_del_ok_{sid}"):
             if st.button("ลบรอบ", key=f"{key}_del_{sid}"):

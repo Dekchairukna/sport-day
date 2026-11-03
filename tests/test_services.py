@@ -461,3 +461,58 @@ def test_read_cache_is_cleared_by_writes(engine):
     sv.update_user(engine, u["id"], username="admin", display_name="ชื่อใหม่", role="admin", color_id=None,
                    perms=[], active=True)
     assert sv.get_user(engine, u["id"])["display_name"] == "ชื่อใหม่"
+
+
+def test_move_attendance_and_history(engine):
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    a = _student(engine, "ก", "ชาย", 1)
+    b = _student(engine, "ข", "หญิง", 1)
+    wrong = sv.create_session(engine, "เช้าก่อนเข้าแถว", date(2026, 11, 3), color_id=pink)
+    late = sv.create_session(engine, "สาย (สีชมพู)", date(2026, 11, 3), color_id=pink)
+    sv.set_attendance_one(engine, wrong, a, "มา", by="พี่ฟ้า")
+    sv.set_attendance_one(engine, wrong, b, "ขาด", by="พี่ฟ้า")
+    sv.set_attendance_one(engine, late, b, "ลา", by="พี่ฝน")
+    assert sv.move_attendance(engine, wrong, late, overwrite=False) == 1  # b ในรอบสายเช็คแล้ว ไม่ทับ
+    r = sv.session_roster(engine, late).set_index("student_id")
+    assert (r.loc[a, "status"], r.loc[b, "status"]) == ("มา", "ลา")
+    assert sv.move_attendance(engine, wrong, late, overwrite=True, delete_src=True, by="ครู") == 2
+    assert sv.session_roster(engine, late).set_index("student_id").loc[b, "status"] == "ขาด"
+    assert wrong not in set(sv.sessions_df(engine)["id"])  # ลบรอบต้นทางแล้ว
+    h = sv.attendance_history(engine, late)
+    assert {"พี่ฝน", "ครู"} <= set(h["by_name"]) and (h["old_status"] == "ลา").any()
+    with pytest.raises(ValueError):
+        sv.move_attendance(engine, late, late)
+
+
+def test_restore_one_round_from_old_file(engine, tmp_path):
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    a = _student(engine, "ก", "ชาย", 1)
+    b = _student(engine, "ข", "หญิง", 1)
+    morning = sv.create_session(engine, "เช้า (สีชมพู)", date(2026, 11, 3), color_id=pink)
+    sv.save_attendance(engine, morning, [{"student_id": a, "status": "มา"}, {"student_id": b, "status": "สาย"}])
+    old = make_engine(f"sqlite:///{tmp_path / 'old.db'}")
+    sv.import_backup(old, sv.export_backup(engine))  # ไฟล์เดิม = ข้อมูลก่อนโดนทับ
+    sv.save_attendance(engine, morning, [{"student_id": a, "status": "ขาด"}, {"student_id": b, "status": "ขาด"}],
+                       by="เด็กกดทับ")
+    assert sv.round_compare(engine, old, morning, morning) == {"in_file": 2, "now": 2, "differ": 2}
+    assert sv.restore_round(engine, old, morning, morning) == 2
+    r = sv.session_roster(engine, morning).set_index("student_id")
+    assert (r.loc[a, "status"], r.loc[b, "status"]) == ("มา", "สาย")
+    assert sv.round_compare(engine, old, morning, morning)["differ"] == 0
+
+
+def test_old_file_without_new_tables_is_still_readable(tmp_path):
+    import sqlite3
+    path = tmp_path / "legacy.db"
+    eng = make_engine(f"sqlite:///{path}")
+    sv.seed_defaults(eng)
+    _student(eng, "เก่า", "ชาย", 1)
+    eng.dispose()
+    con = sqlite3.connect(path)  # ไฟล์จากโค้ดรุ่นก่อน: ยังไม่มีตารางประวัติ/รางวัล
+    con.executescript("DROP TABLE attendance_log; DROP TABLE awards; DROP TABLE placings;")
+    con.commit(); con.close()
+    from sqlalchemy import create_engine
+    assert sv.data_counts(create_engine(f"sqlite:///{path}"))["students"] == 1  # นับได้แม้ตารางไม่ครบ
+    sv.clear_cache()
+    old = make_engine(f"sqlite:///{path}")  # เปิดแบบเติมตารางที่ขาด แล้ว export ได้
+    assert sv.backup_summary(sv.export_backup(old))["students"] == 1
