@@ -420,3 +420,18 @@ def test_backup_into_postgres(engine):
     assert new_id > a  # sequence ถูกตั้งต่อจากข้อมูลที่กู้คืน
     sv.create_user(pg, "kru2", "secret2", "staff")
     sv.create_daily_rounds(pg, date(2026, 11, 5), date(2026, 11, 5), [sv.color_id_by_name(pg, "ชมพู")])
+
+
+def test_empty_database_does_not_crash(tmp_path):
+    from sportsday import reports as rp
+    eng = make_engine(f"sqlite:///{tmp_path / 'empty.db'}")
+    sv.seed_defaults(eng, schedule_csv=tmp_path / "none.csv")  # ไม่มีนักเรียน ไม่มีรายการแข่ง
+    pink = sv.color_id_by_name(eng, "ชมพู")
+    todo = sv.color_todo(eng, pink)
+    assert todo["unpaid"].empty and todo["events_without_athletes"] == []
+    assert sv.standings(eng)["trophies"].sum() == 0
+    assert sv.medal_table(eng)["รวม"].sum() == 0 and sv.athlete_leaderboard(eng).empty
+    assert sv.best_athletes(eng).empty and sv.events_df(eng, include_cancelled=False).empty
+    for kind in rp.CERT_KINDS:
+        assert rp.certificate_items(eng, kind).empty
+    assert rp.pdf_report(eng).startswith(b"%PDF") and rp.excel_report(eng)[:2] == b"PK"

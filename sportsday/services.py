@@ -382,6 +382,8 @@ def students_df(engine: Engine, include_inactive: bool = False) -> pd.DataFrame:
         ent = pd.read_sql(
             select(db.entries.c.student_id, db.entries.c.event_id), c
         )
+    for col in ("shirt_paid", "active"):  # ตารางว่างทำให้ pandas เดาชนิดผิด ต้องกำหนดเป็น bool ชัด ๆ
+        df[col] = df[col].fillna(False).astype(bool)
     df["full_name"] = df["prefix"] + df["first_name"] + " " + df["last_name"]
     df["class"] = "ม." + df["grade"].astype(str) + "/" + df["room"].astype(str)
     role_map = roles.groupby("student_id")["name"].apply(list).to_dict()
@@ -583,8 +585,10 @@ def events_df(engine: Engine, include_cancelled: bool = True) -> pd.DataFrame:
         cnt = pd.read_sql(
             select(db.entries.c.event_id, func.count().label("n")).group_by(db.entries.c.event_id), c
         )
+    df["cancelled"] = df["cancelled"].fillna(False).astype(bool)
     if df.empty:
-        for col in ["name", "label", "winner", "score", "trophy_status", "athletes", "end", "status"]:
+        for col in ["name", "label", "winner", "winner_hex", "winner_color_id", "score", "result_note", "recorded_by",
+                    "recorded_at", "trophy_status", "trophy_note", "athletes", "end", "status"]:
             df[col] = []
         return df
     df["date"] = pd.to_datetime(df["date"]).dt.date

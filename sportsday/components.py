@@ -94,7 +94,8 @@ def member_editor(engine, st_df: pd.DataFrame, key: str) -> None:
             rmap = dict(zip(r.id, r.name))
             sel_roles += st.multiselect(glabel, list(rmap), default=[k for k, n in rmap.items() if n in s["roles"]],
                                         format_func=rmap.get, key=f"{key}_roles_{grp}_{sid}")
-        elig = ev[[sv.is_eligible(gender, grade, g, lv) for g, lv in zip(ev.gender, ev.level)]]
+        elig = ev[pd.Series([sv.is_eligible(gender, grade, g, lv) for g, lv in zip(ev.gender, ev.level)],
+                            index=ev.index, dtype=bool)]
         emap = dict(zip(elig.id, elig.name + " (" + elig["date"].map(lambda d: f"{d:%d/%m}") + " " + elig.start + ")"))
         sel_events = st.multiselect(
             "นักกีฬา: รายการที่ลงแข่ง (แสดงเฉพาะรุ่นที่ตรงกับเพศและชั้น)", list(emap),
@@ -137,7 +138,9 @@ def athlete_picker(engine, key: str, color_id: int | None = None) -> None:
     e = ev.set_index("id").loc[eid]
     st.caption(f"รับเฉพาะ: {sv.event_label(e.gender, e.level)} · แสดงเฉพาะนักเรียนที่ตรงรุ่น")
     studs = sv.students_df(engine)
-    elig = studs[[sv.is_eligible(g, gr, e.gender, e.level) for g, gr in zip(studs.gender, studs.grade)]]
+    # ใช้ Series ชนิด bool เสมอ: ถ้าเป็นลิสต์ว่าง pandas จะตีความเป็นการเลือกคอลัมน์ (ตอนยังไม่มีนักเรียน)
+    elig = studs[pd.Series([sv.is_eligible(g, gr, e.gender, e.level) for g, gr in zip(studs.gender, studs.grade)],
+                           index=studs.index, dtype=bool)]
     current = sv.entries_df(engine, eid)
     current_ids = set(current.student_id)
     chosen: list[int] = []
