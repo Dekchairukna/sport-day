@@ -7,6 +7,7 @@ import streamlit as st
 from sportsday import color_view, services as sv, ui
 
 st.set_page_config(page_title="ระบบกีฬาสี", page_icon="🏆", layout="wide")
+sv.clear_cache()  # เริ่มรอบใหม่ อ่านข้อมูลล่าสุดจากฐานข้อมูล
 ui.setup_page()
 engine = ui.get_engine()  # สร้างฐานข้อมูลและข้อมูลตั้งต้นครั้งแรก
 ui.band(engine)

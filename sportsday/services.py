@@ -4,21 +4,54 @@
 """
 from __future__ import annotations
 
+import copy
 import csv
+import functools
 import hashlib
 import hmac
 import json
 import secrets
+import threading
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
-from sqlalchemy import and_, delete, func, insert, select, update
+from sqlalchemy import and_, delete, event, func, insert, select, update
 from sqlalchemy.engine import Engine
 
 from . import db
+
+# ---------------------------------------------------------------- แคชระหว่างการรันหนึ่งรอบ
+# ฐานข้อมูลบนเว็บอยู่ไกล (ทุกคำสั่งใช้เวลาไปกลับ) จึงจำผลการอ่านไว้ใช้ซ้ำภายในการรันหน้าเดียวกัน
+# แยกตามเธรด (หนึ่งผู้ใช้ = หนึ่งเธรด) · ล้างทุกครั้งที่เริ่มรันหน้าใหม่ และทุกครั้งที่มีการเขียนข้อมูล (commit)
+_local = threading.local()
+
+
+def clear_cache() -> None:
+    _local.d = {}
+
+
+def _watch(engine: Engine) -> None:
+    if not getattr(engine, "_sd_watch", False):
+        event.listen(engine, "commit", lambda conn: clear_cache())
+        engine._sd_watch = True
+
+
+def cached(fn):
+    @functools.wraps(fn)
+    def wrapper(engine, *args, **kwargs):
+        _watch(engine)
+        key = (fn.__name__, id(engine), args, tuple(sorted(kwargs.items())))
+        d = getattr(_local, "d", None)
+        if d is None:
+            d = _local.d = {}
+        if key not in d:
+            d[key] = fn(engine, *args, **kwargs)
+        v = d[key]
+        return v.copy() if isinstance(v, pd.DataFrame) else copy.deepcopy(v)
+    return wrapper
 
 GRADES = [1, 2, 3, 4, 5, 6]
 GENDERS = ["ชาย", "หญิง"]
@@ -122,9 +155,14 @@ def seed_defaults(engine: Engine, schedule_csv: Path | None = None) -> None:
             import_schedule(engine, path)
 
 
-def get_setting(engine: Engine, key: str) -> str:
+@cached
+def _all_settings(engine: Engine) -> dict:
     with engine.connect() as c:
-        v = c.execute(select(db.settings.c.value).where(db.settings.c.key == key)).scalar()
+        return {r.key: r.value for r in c.execute(select(db.settings))}
+
+
+def get_setting(engine: Engine, key: str) -> str:
+    v = _all_settings(engine).get(key)
     return v if v is not None else DEFAULT_SETTINGS.get(key, "")
 
 
@@ -227,6 +265,7 @@ def _check_password_rule(password: str) -> None:
         raise ValueError(f"รหัสผ่านต้องยาวอย่างน้อย {MIN_PASSWORD} ตัว")
 
 
+@cached
 def users_df(engine: Engine) -> pd.DataFrame:
     q = (select(db.users.c.id, db.users.c.username, db.users.c.display_name, db.users.c.role,
                 db.users.c.color_id, db.colors.c.name.label("color"), db.colors.c.hex.label("color_hex"),
@@ -239,6 +278,7 @@ def users_df(engine: Engine) -> pd.DataFrame:
                                      "perms", "active", "created_at", "last_login"])
 
 
+@cached
 def get_user(engine: Engine, user_id: int) -> dict | None:
     with engine.connect() as c:
         r = c.execute(select(db.users).where(db.users.c.id == user_id)).mappings().first()
@@ -341,6 +381,7 @@ def migrate_color_perms(engine: Engine) -> None:
 
 # ---------------------------------------------------------------- สี
 
+@cached
 def list_colors(engine: Engine) -> pd.DataFrame:
     with engine.connect() as c:
         return pd.read_sql(select(db.colors).order_by(db.colors.c.id), c)
@@ -358,6 +399,7 @@ def color_id_by_name(engine: Engine, name: str) -> int | None:
 
 # ---------------------------------------------------------------- สมาชิก
 
+@cached
 def students_df(engine: Engine, include_inactive: bool = False) -> pd.DataFrame:
     s, col = db.students, db.colors
     q = (
@@ -490,6 +532,7 @@ def import_members_csv(engine: Engine, rows: Iterable[dict]) -> dict:
 
 # ---------------------------------------------------------------- หน้าที่
 
+@cached
 def roles_df(engine: Engine) -> pd.DataFrame:
     with engine.connect() as c:
         return pd.read_sql(select(db.roles).order_by(db.roles.c.grp, db.roles.c.sort, db.roles.c.id), c)
@@ -570,6 +613,7 @@ def import_schedule(engine: Engine, path: Path) -> int:
     return n
 
 
+@cached
 def events_df(engine: Engine, include_cancelled: bool = True) -> pd.DataFrame:
     """รายการแข่งทั้งหมด พร้อมผล ถ้วย และจำนวนนักกีฬาแต่ละสี"""
     with engine.connect() as c:
@@ -610,6 +654,7 @@ def events_df(engine: Engine, include_cancelled: bool = True) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+@cached
 def entries_df(engine: Engine, event_id: int | None = None) -> pd.DataFrame:
     s, en, col = db.students, db.entries, db.colors
     q = (
@@ -724,6 +769,7 @@ def clear_result(engine: Engine, event_id: int) -> None:
         c.execute(delete(db.results).where(db.results.c.event_id == event_id))
 
 
+@cached
 def standings(engine: Engine) -> pd.DataFrame:
     """จำนวนถ้วยของแต่ละสี เรียงมากไปน้อย"""
     cols = list_colors(engine)
@@ -808,6 +854,7 @@ def color_moves_df(engine: Engine) -> pd.DataFrame:
 
 # ---------------------------------------------------------------- กิจกรรมเช็คชื่อ
 
+@cached
 def activities_df(engine: Engine, include_inactive: bool = False) -> pd.DataFrame:
     q = select(db.activities).order_by(db.activities.c.sort, db.activities.c.id)
     if not include_inactive:
@@ -878,6 +925,7 @@ def create_session(engine: Engine, title: str, d: date, event_id: int | None = N
         )).inserted_primary_key[0]
 
 
+@cached
 def sessions_df(engine: Engine) -> pd.DataFrame:
     s = db.att_sessions
     q = (select(s, db.activities.c.name.label("activity"))
@@ -1069,6 +1117,7 @@ def set_places(engine: Engine, event_id: int, places: dict[int, int]) -> None:
             c.execute(insert(db.placings), rows)
 
 
+@cached
 def event_places(engine: Engine) -> pd.DataFrame:
     """อันดับของแต่ละสีในแต่ละรายการที่มีผลแล้ว: event_id, color_id, place
     อันดับ 1 = สีที่ได้ถ้วย · อันดับ 2-3 ตามที่บันทึก · ถ้ามี 2 สี สีที่แพ้ได้อันดับ 2 อัตโนมัติ"""
@@ -1118,6 +1167,7 @@ def medal_by_sport(engine: Engine) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@cached
 def athlete_results(engine: Engine) -> pd.DataFrame:
     """ผลรายนักกีฬารายรายการ: นักกีฬา + รายการ + สีที่ลงแข่ง + อันดับ (ว่าง = เข้าร่วม/ยังไม่มีผล)"""
     en = entries_df(engine)
@@ -1135,6 +1185,7 @@ def athlete_results(engine: Engine) -> pd.DataFrame:
     return df
 
 
+@cached
 def athlete_leaderboard(engine: Engine) -> pd.DataFrame:
     """จัดอันดับนักกีฬา: เหรียญรวมมากสุด > ทอง > เงิน > ทองแดง > จำนวนรายการที่ลง"""
     ar = athlete_results(engine)
@@ -1173,6 +1224,7 @@ def best_athletes(engine: Engine) -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True)[cols] if rows else pd.DataFrame(columns=cols)
 
 
+@cached
 def awards_df(engine: Engine) -> pd.DataFrame:
     with engine.connect() as c:
         a = pd.read_sql(select(db.awards).order_by(db.awards.c.id), c)

@@ -352,8 +352,10 @@ def daily_rounds_form(engine, key: str, color_id: int | None, compact: bool = Fa
             st.success(msg + " · ไปเช็คได้ที่แท็บ เช็คชื่อ")
 
 
+@st.fragment
 def checklist(engine, key: str, sid: int) -> None:
-    """เช็คชื่อแบบกดปุ่มรายคน ใช้บนมือถือได้ · กดแล้วบันทึกทันที"""
+    """เช็คชื่อแบบกดปุ่มรายคน ใช้บนมือถือได้ · กดแล้วบันทึกทันที
+    เป็น fragment: กดปุ่มแล้วรันใหม่เฉพาะส่วนนี้ ไม่ต้องโหลดทั้งหน้า (เร็วขึ้นมากเมื่อฐานข้อมูลอยู่ไกล)"""
     roster = sv.session_roster(engine, sid)
     if roster.empty:
         st.warning("รอบนี้ยังไม่มีรายชื่อ (เช่น ยังไม่ได้จัดนักกีฬาในรายการ หรือยังไม่มีใครได้หน้าที่นี้)")
@@ -386,7 +388,7 @@ def checklist(engine, key: str, sid: int) -> None:
                                width="stretch"):
         sv.mark_unchecked(engine, sid, left["student_id"])
         st.session_state[ver_key] = ver + 1
-        st.rerun()
+        st.rerun(scope="fragment")
 
     def save(student_id: int, wkey: str) -> None:
         sv.set_attendance_one(engine, sid, student_id, st.session_state.get(wkey))
@@ -414,7 +416,7 @@ def checklist(engine, key: str, sid: int) -> None:
         if st.button("บันทึกตาราง", type="primary", key=f"{key}_save_{sid}"):
             sv.save_attendance(engine, sid, out.to_dict("records"))
             st.session_state[ver_key] = ver + 1
-            st.rerun()
+            st.rerun(scope="fragment")
     with st.expander("ลบรอบนี้"):
         if st.checkbox("ยืนยันการลบรอบและผลเช็คชื่อทั้งหมดของรอบนี้", key=f"{key}_del_ok_{sid}"):
             if st.button("ลบรอบ", key=f"{key}_del_{sid}"):

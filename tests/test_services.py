@@ -6,6 +6,13 @@ from sportsday import services as sv
 from sportsday.db import make_engine
 
 
+@pytest.fixture(autouse=True)
+def _fresh_cache():
+    sv.clear_cache()  # แคชผูกกับ id ของ engine ซึ่งอาจซ้ำกันระหว่างเทสต์
+    yield
+    sv.clear_cache()
+
+
 @pytest.fixture()
 def engine(tmp_path):
     eng = make_engine(f"sqlite:///{tmp_path / 't.db'}")
@@ -435,3 +442,22 @@ def test_empty_database_does_not_crash(tmp_path):
     for kind in rp.CERT_KINDS:
         assert rp.certificate_items(eng, kind).empty
     assert rp.pdf_report(eng).startswith(b"%PDF") and rp.excel_report(eng)[:2] == b"PK"
+
+
+def test_read_cache_is_cleared_by_writes(engine):
+    n = len(sv.list_colors(engine))
+    df = sv.list_colors(engine)
+    df.loc[0, "name"] = "แก้ในตัวแปร"  # แก้สำเนาที่ได้มา ต้องไม่กระทบแคช
+    assert "แก้ในตัวแปร" not in sv.list_colors(engine)["name"].tolist()
+    sv.add_color(engine, "เหลือง", "#ffcc00")  # เขียน = ล้างแคช
+    assert len(sv.list_colors(engine)) == n + 1
+    before = len(sv.students_df(engine))
+    _student(engine, "แคช", "ชาย", 1)
+    assert len(sv.students_df(engine)) == before + 1
+    sv.set_setting(engine, "school_name", "โรงเรียนทดสอบ")
+    assert sv.get_setting(engine, "school_name") == "โรงเรียนทดสอบ"
+    sv.seed_users(engine, "9999")
+    u = sv.authenticate(engine, "admin", "9999")
+    sv.update_user(engine, u["id"], username="admin", display_name="ชื่อใหม่", role="admin", color_id=None,
+                   perms=[], active=True)
+    assert sv.get_user(engine, u["id"])["display_name"] == "ชื่อใหม่"
