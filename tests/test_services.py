@@ -516,3 +516,58 @@ def test_old_file_without_new_tables_is_still_readable(tmp_path):
     sv.clear_cache()
     old = make_engine(f"sqlite:///{path}")  # เปิดแบบเติมตารางที่ขาด แล้ว export ได้
     assert sv.backup_summary(sv.export_backup(old))["students"] == 1
+
+
+def test_daily_summary(engine):
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    blue = sv.color_id_by_name(engine, "น้ำเงิน")
+    a = _student(engine, "ก", "ชาย", 1, "ชมพู")
+    b = _student(engine, "ข", "หญิง", 1, "ชมพู")
+    c = _student(engine, "ค", "หญิง", 1, "น้ำเงิน")
+    sv.create_daily_rounds(engine, date(2026, 11, 3), date(2026, 11, 3), [pink, blue])
+    ses = sv.sessions_df(engine)
+    m_pink = int(ses[(ses.color_id == pink) & ses.title.str.startswith("เช้า")].iloc[0]["id"])
+    sv.set_attendance_one(engine, m_pink, a, "มา")
+    sv.set_attendance_one(engine, m_pink, b, "ขาด")
+    ds = sv.daily_summary(engine, pink)
+    assert len(ds) == 3 and list(ds["รอบ"]) == ["เช้า", "สาย", "บ่าย"]
+    row = ds.iloc[0]
+    assert (row["ทั้งหมด"], row["มา"], row["ขาด"], row["ยังไม่เช็ค"], row["ร้อยละมา"]) == (2, 1, 1, 0, 50)
+    assert ds.iloc[1]["ยังไม่เช็ค"] == 2
+    assert len(sv.daily_summary(engine)) == 6 and set(sv.daily_summary(engine)["color"]) == {"สีชมพู", "สีน้ำเงิน"}
+    ab = sv.absent_list(engine, [m_pink])
+    assert list(ab["full_name"].str.contains("ข")) == [True] and list(ab["status"]) == ["ขาด"]
+
+
+def _stand_member(engine, name, gender, color="ชมพู", grade=1):
+    sid = _student(engine, name, gender, grade, color)
+    role = int(sv.roles_df(engine).set_index("name").loc[sv.STAND_ROLE, "id"])
+    sv.set_student_roles(engine, sid, [role])
+    return sid
+
+
+def test_stand_seating(engine):
+    from sportsday import reports as rp
+    pink = sv.color_id_by_name(engine, "ชมพู")
+    blue = sv.color_id_by_name(engine, "น้ำเงิน")
+    assert sv.stand_size(engine) == (5, 10)
+    boys = [_stand_member(engine, f"ช{i}", "ชาย") for i in range(3)]
+    girls = [_stand_member(engine, f"ญ{i}", "หญิง") for i in range(2)]
+    _student(engine, "ไม่ขึ้นสแตนด์", "ชาย", 1)  # ไม่มีหน้าที่ ไม่ถูกจัด
+    n, left = sv.auto_fill_stand(engine, pink, "สลับชายหญิง")
+    assert (n, left) == (5, 0)
+    seats = sv.stand_seats(engine, pink).sort_values(["row", "col"])
+    assert list(seats["row"]) == [1] * 5 and list(seats["col"]) == [1, 2, 3, 4, 5]  # เติมแถวหน้า A ก่อน
+    assert list(seats["gender"]) == ["ชาย", "หญิง", "ชาย", "หญิง", "ชาย"]
+    late = _stand_member(engine, "มาทีหลัง", "หญิง")
+    assert sv.auto_fill_stand(engine, pink)[0] == 1  # เก็บของเดิม เติมเฉพาะคนใหม่
+    assert set(sv.stand_seats(engine, pink).student_id) == set(boys + girls + [late])
+    with pytest.raises(ValueError):
+        sv.save_stand(engine, pink, {(1, 1): boys[0], (2, 1): boys[0]})  # คนเดียวสองที่
+    sv.set_stand_size(engine, 2, 2)
+    assert sv.auto_fill_stand(engine, pink, keep_existing=False) == (4, 2)  # ที่นั่งไม่พอ 2 คน
+    sv.move_color(engine, boys[0], blue)  # ย้ายสีแล้วที่นั่งเดิมถูกเอาออก
+    assert boys[0] not in set(sv.stand_seats(engine, pink).student_id)
+    assert rp.stand_pdf(engine, [pink, blue]).startswith(b"%PDF")
+    with pytest.raises(ValueError):
+        sv.set_stand_size(engine, 0, 10)

@@ -25,6 +25,14 @@ with tab_gen:
             sv.set_setting(engine, "event_title", title.strip())
             sv.set_setting(engine, "school_name", school.strip())
             st.success("บันทึกแล้ว · ใช้บนกระดานผล รายงาน และสติ๊กเกอร์")
+    st.markdown("#### ขนาดสแตนด์ (ใช้ทุกสี)")
+    r0, c0 = sv.stand_size(engine)
+    c1, c2, c3 = st.columns([1, 1, 1])
+    nr = c1.number_input("จำนวนแถว", 1, 26, r0, key="stand_rows")
+    nc = c2.number_input("ที่นั่งต่อแถว", 1, 40, c0, key="stand_cols")
+    if c3.button("บันทึกขนาด", key="stand_size_save"):
+        sv.set_stand_size(engine, int(nr), int(nc))
+        st.success(f"สแตนด์ {nr} แถว แถวละ {nc} ที่")
 
 with tab_import:
     st.markdown("#### นำเข้ารายชื่อนักเรียน (CSV)")
@@ -177,7 +185,9 @@ if tab_backup:
             except Exception:  # ไฟล์เดิมเปิดไม่ได้หรือโครงสร้างเก่าเกินไป
                 old, old_counts = None, {}
             if old is not None and old_counts.get("students", 0):
-                st.caption("พบข้อมูลในไฟล์เดิม: " + show_counts(old_counts))
+                from zoneinfo import ZoneInfo
+                saved = datetime.fromtimestamp(legacy.stat().st_mtime, ZoneInfo("Asia/Bangkok"))
+                st.caption(f"ไฟล์เดิม (ก่อนย้ายเข้าฐานข้อมูลถาวร) บันทึกล่าสุด {saved:%d/%m %H:%M} น. · มี: " + show_counts(old_counts))
                 already = sv.data_counts(engine).get("students", 0) > 0
                 box = st.expander("ย้ายซ้ำทั้งหมด (ระวัง: ทับข้อมูลที่กรอกหลังย้ายแล้ว)") if already else st.container()
                 with box:

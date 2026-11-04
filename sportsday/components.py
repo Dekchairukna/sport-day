@@ -5,12 +5,13 @@
 from __future__ import annotations
 
 import html
+import io
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
-from . import services as sv, ui
+from . import reports, services as sv, ui
 from .reports import thai_date
 
 SHIRT_SIZES = ["", "S", "M", "L", "XL", "2XL", "3XL", "4XL"]
@@ -291,6 +292,7 @@ def attendance_panel(engine, key: str, color_id: int | None = None) -> None:
             checklist(engine, key, sid, color_id)
 
     with tab_sum:
+        daily_panel(engine, key, color_id, colors)
         st.markdown("#### แยกตามกิจกรรม")
         ov = sv.activity_overview(engine, color_id)
         if ov.empty:
@@ -455,6 +457,157 @@ def checklist(engine, key: str, sid: int, color_id: int | None = None) -> None:
                 sv.delete_session(engine, sid)
                 st.session_state.pop(f"{key}_session", None)
                 st.rerun()
+
+
+def daily_panel(engine, key: str, color_id: int | None, colors: pd.DataFrame) -> None:
+    """สรุปเช็คชื่อรายวันของแต่ละสี + รายชื่อคนที่ขาด/ลา/สาย"""
+    st.markdown("#### สรุปรายวัน")
+    pick = color_id
+    if color_id is None:
+        opts = {0: "ทุกสี", **dict(zip(colors["id"], "สี" + colors["name"]))}
+        pick = st.selectbox("สี", list(opts), format_func=opts.get, key=f"{key}_dcolor") or None
+    ds = sv.daily_summary(engine, pick)
+    if ds.empty:
+        st.caption("ยังไม่มีรอบเช็คชื่อ")
+        return
+    days = sorted(ds["day"].unique(), reverse=True)
+    today = datetime.now().date()
+    day = st.selectbox("วันที่", days, index=days.index(today) if today in days else 0, format_func=thai_date,
+                       key=f"{key}_dday")
+    one = ds[ds["day"] == day]
+    pct = st.column_config.ProgressColumn("ร้อยละมา", min_value=0, max_value=100, format="%d%%")
+    show = one.drop(columns=["session_id", "day"]).rename(columns={"color": "สี"})
+    if pick is not None:
+        show = show.drop(columns="สี")
+    st.dataframe(show, hide_index=True, width="stretch", column_config={"ร้อยละมา": pct})
+
+    ab = sv.absent_list(engine, one["session_id"])
+    if pick is not None and not ab.empty:
+        ab = ab[ab["color"] == colors.set_index("id").loc[pick, "name"]]
+    label = f"รายชื่อคนที่ ขาด / ลา / สาย วันนี้ ({len(ab)} รายการ)" if day == today else \
+        f"รายชื่อคนที่ ขาด / ลา / สาย ({len(ab)} รายการ)"
+    with st.expander(label, expanded=False):
+        if ab.empty:
+            st.caption("ไม่มี")
+        else:
+            st.dataframe(ab.rename(columns={"status": "สถานะ", "full_name": "ชื่อ-สกุล", "class": "ชั้น", "color": "สี",
+                                            "note": "หมายเหตุ"}), hide_index=True, width="stretch")
+
+    with st.expander("ภาพรวมทุกวัน"):
+        grid = ds.assign(ช่อง=ds["color"] + " · " + ds["รอบ"]) if pick is None else ds.assign(ช่อง=ds["รอบ"])
+        piv = grid.pivot_table(index="day", columns="ช่อง", values="ร้อยละมา", aggfunc="first")
+        piv = piv[list(dict.fromkeys(grid["ช่อง"]))].sort_index(ascending=False)  # เรียงรอบตามเวลา เช้า→บ่าย
+        piv.index = [thai_date(d) for d in piv.index]
+        st.caption("ร้อยละการมา (นับสายเป็นมา) ของแต่ละรอบ")
+        st.dataframe(piv.map(lambda v: "" if pd.isna(v) else f"{int(v)}%"), width="stretch")
+        buf = io.BytesIO()
+        ds.drop(columns="session_id").rename(columns={"day": "วันที่", "color": "สี"}).to_excel(buf, index=False)
+        st.download_button("ดาวน์โหลดสรุปรายวัน (Excel)", buf.getvalue(), "สรุปเช็คชื่อรายวัน.xlsx",
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"{key}_dxl")
+
+
+# ---------------------------------------------------------------- แผนผังสแตนด์
+
+def stand_grid_html(engine, color_id: int) -> str:
+    """ภาพแผนผัง: แถวหลังอยู่บน แถวหน้า (A) อยู่ล่างติดสนาม · สีฟ้า = ชาย ชมพู = หญิง"""
+    rows, cols = sv.stand_size(engine)
+    seats = sv.stand_seats(engine, color_id)
+    at = {(int(r["row"]), int(r["col"])): r for r in seats.to_dict("records")}
+    cells = [f'<div class="sg-h"></div>'] + [f'<div class="sg-h">{k}</div>' for k in range(1, cols + 1)]
+    for r in range(rows, 0, -1):
+        cells.append(f'<div class="sg-h">{sv.ROW_LABELS[r - 1]}</div>')
+        for k in range(1, cols + 1):
+            s = at.get((r, k))
+            if s is None:
+                cells.append(f'<div class="sg-c empty"><span>{sv.seat_label(r, k)}</span></div>')
+            else:
+                g = "m" if s["gender"] == "ชาย" else "f"
+                cells.append(f'<div class="sg-c {g}" title="{html.escape(str(s["full_name"]))}">'
+                             f'<span>{sv.seat_label(r, k)}</span><b>{html.escape(str(s["first_name"]))}</b>'
+                             f'<i>{html.escape(str(s["class"]))}</i></div>')
+    return (f'<div class="sg-wrap"><div class="sg" style="grid-template-columns: 28px repeat({cols}, minmax(72px, 1fr))">'
+            + "".join(cells) + f'</div><div class="sg-field" style="margin-left:32px">ด้านหน้า · สนาม</div></div>')
+
+
+def stand_panel(engine, key: str, color_id: int) -> None:
+    rows, cols = sv.stand_size(engine)
+    seats = sv.stand_seats(engine, color_id)
+    cand = sv.stand_candidates(engine, color_id)
+    seated = set(seats["student_id"])
+    waiting = cand[~cand.id.isin(seated)]
+    st.markdown(ui.tags([f"จัดแล้ว {len(seats)} / {rows * cols} ที่", f"มีหน้าที่{sv.STAND_ROLE} {len(cand)} คน",
+                         f"ยังไม่มีที่นั่ง {len(waiting)} คน"]), unsafe_allow_html=True)
+    st.markdown(stand_grid_html(engine, color_id), unsafe_allow_html=True)
+    st.caption(f"{rows} แถว แถวละ {cols} ที่ · แถว A อยู่หน้าสุดติดสนาม · ฟ้า = ชาย ชมพู = หญิง · "
+               f"เลือกคนจากสมาชิกที่มีหน้าที่ \"{sv.STAND_ROLE}\" (ตั้งได้ที่แท็บ แก้ไขสมาชิก)")
+    if msg := st.session_state.pop(f"{key}_flash", None):
+        st.success(msg)
+    st.download_button("ดาวน์โหลดแผนผัง PDF (A4 แนวนอน)", reports.stand_pdf(engine, [color_id]),
+                       "แผนผังสแตนด์.pdf", "application/pdf", key=f"{key}_pdf")
+
+    with st.expander("จัดที่นั่งอัตโนมัติ", expanded=seats.empty):
+        mode = st.radio("วิธีเรียง", ["ชั้น", "สลับชายหญิง"], horizontal=True, key=f"{key}_mode",
+                        format_func={"ชั้น": "เรียงตามชั้น/ห้อง", "สลับชายหญิง": "สลับชาย-หญิง"}.get)
+        only = st.checkbox(f"เฉพาะคนที่มีหน้าที่ {sv.STAND_ROLE}", value=True, key=f"{key}_only")
+        keep = st.checkbox("เก็บที่นั่งที่จัดไว้แล้ว เติมเฉพาะที่ว่าง", value=True, key=f"{key}_keep")
+        if st.button("จัดที่นั่ง", type="primary", key=f"{key}_auto"):
+            n, left = sv.auto_fill_stand(engine, color_id, mode, keep, only)
+            st.session_state[f"{key}_flash"] = f"จัดที่นั่งเพิ่ม {n} คน" + (f" · ที่นั่งไม่พอ {left} คน" if left else "")
+            st.rerun()
+
+    with st.expander("สลับที่นั่ง 2 คน (สะดวกบนมือถือ)"):
+        labels = {(int(r["row"]), int(r["col"])): f"{sv.seat_label(int(r['row']), int(r['col']))} · {r['full_name']}"
+                  for r in seats.to_dict("records")}
+        allspots = {(r, k): labels.get((r, k), f"{sv.seat_label(r, k)} · (ว่าง)")
+                    for r in range(1, rows + 1) for k in range(1, cols + 1)}
+        c1, c2 = st.columns(2)
+        a = c1.selectbox("ที่นั่งที่ 1", list(allspots), format_func=allspots.get, key=f"{key}_sw_a")
+        b = c2.selectbox("ที่นั่งที่ 2", list(allspots), format_func=allspots.get, index=1, key=f"{key}_sw_b")
+        if st.button("สลับ", key=f"{key}_swap", disabled=a == b):
+            cur = {(int(r["row"]), int(r["col"])): int(r["student_id"]) for r in seats.to_dict("records")}
+            va, vb = cur.pop(a, None), cur.pop(b, None)
+            if va:
+                cur[b] = va
+            if vb:
+                cur[a] = vb
+            sv.save_stand(engine, color_id, cur)
+            st.session_state[f"{key}_flash"] = f"สลับ {sv.seat_label(*a)} กับ {sv.seat_label(*b)} แล้ว"
+            st.rerun()
+
+    with st.expander("แก้ทั้งแผนผังแบบตาราง (สะดวกบนคอมพิวเตอร์)"):
+        members = sv.students_df(engine)
+        members = members[members.color_id == color_id].sort_values(["grade", "room", "first_name"])
+        name_of = dict(zip(members["id"], members["full_name"] + " (" + members["class"] + ")"))
+        id_of = {v: k for k, v in name_of.items()}
+        grid = pd.DataFrame("", index=[sv.ROW_LABELS[r - 1] for r in range(1, rows + 1)],
+                            columns=[str(k) for k in range(1, cols + 1)])
+        for r in seats.to_dict("records"):
+            if int(r["student_id"]) in name_of:
+                grid.iloc[int(r["row"]) - 1, int(r["col"]) - 1] = name_of[int(r["student_id"])]
+        opts = [""] + list(name_of.values())
+        out = st.data_editor(grid, key=f"{key}_grid_{len(seats)}", width="stretch",
+                             column_config={c: st.column_config.SelectboxColumn(c, options=opts, width="small")
+                                            for c in grid.columns})
+        st.caption("แถว A = หน้าสุด · เลือกชื่อในช่อง หรือเลือกช่องว่างเพื่อเอาออก แล้วกดบันทึก")
+        if st.button("บันทึกแผนผัง", type="primary", key=f"{key}_save"):
+            new = {(i + 1, int(c)): id_of[v] for i, (_, row) in enumerate(out.iterrows())
+                   for c, v in row.items() if v and v in id_of}
+            try:
+                n = sv.save_stand(engine, color_id, new)
+                st.session_state[f"{key}_flash"] = f"บันทึกแผนผังแล้ว {n} คน"
+                st.rerun()
+            except ValueError as err:
+                st.error(str(err))
+
+    if not waiting.empty:
+        with st.expander(f"ยังไม่มีที่นั่ง ({len(waiting)} คน)"):
+            st.markdown(ui.tags([f"{n} ({k})" for n, k in zip(waiting.full_name, waiting["class"])]),
+                        unsafe_allow_html=True)
+    with st.expander("ล้างแผนผังทั้งหมด"):
+        if st.checkbox("ยืนยันล้างที่นั่งทุกที่ของสีนี้", key=f"{key}_clr_ok") and \
+                st.button("ล้างแผนผัง", key=f"{key}_clr"):
+            sv.save_stand(engine, color_id, {})
+            st.rerun()
 
 
 # ---------------------------------------------------------------- เสื้อสี

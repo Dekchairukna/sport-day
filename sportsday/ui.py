@@ -72,6 +72,19 @@ h1 { font-weight: 700 !important; } h2, h3, h4 { font-weight: 600 !important; }
 .score-card .big-num { font-size:3.4rem; line-height:1.2; font-weight:700; font-variant-numeric: tabular-nums; color: inherit; }
 .score-card .lbl { font-size:1.05rem; font-family: var(--f-display); font-weight: 500; }
 .muted { color: var(--muted); font-size:.9rem }
+/* แผนผังสแตนด์ */
+.sg-wrap { overflow-x: auto; padding-bottom: 6px; }
+.sg { display: grid; gap: 4px; min-width: max-content; }
+.sg-h { font-family: var(--f-display); font-weight: 600; color: var(--muted); text-align: center; align-self: center; font-size: 13px; }
+.sg-c { border-radius: 8px; padding: 4px 4px 5px; min-height: 58px; display: flex; flex-direction: column; align-items: center;
+        justify-content: center; text-align: center; line-height: 1.25; border: 1px solid var(--line); background: var(--surface); }
+.sg-c span { font-size: 10px; color: var(--muted); }
+.sg-c b { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.sg-c i { font-style: normal; font-size: 11px; color: var(--muted); }
+.sg-c.m { background: #e3effd; border-color: #b9d4f5; } .sg-c.f { background: #fde7ee; border-color: #f4bfd0; }
+.sg-c.empty { border-style: dashed; background: transparent; }
+.sg-field { margin-top: 6px; background: var(--mint); color: var(--mint-ink); border-radius: 8px; text-align: center;
+            padding: 6px; font-family: var(--f-display); font-weight: 600; min-width: max-content; }
 .medals { display:flex; gap:8px; margin:8px 0 6px; flex-wrap:wrap; }
 .medals .m { font-family: var(--f-display); font-size: 2.2rem; font-weight: 700; line-height: 1.25; min-width: 3.4rem;
              text-align: center; border-radius: 12px; padding: 2px 10px; font-variant-numeric: tabular-nums; }

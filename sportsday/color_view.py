@@ -44,7 +44,7 @@ def render(color_id: int) -> None:
 
     key = f"c{color_id}"
     todo = sv.color_todo(engine, color_id)
-    tabs = st.tabs(["งานที่ต้องทำ", "จัดนักกีฬา", "รายชื่อสี", "แก้ไขสมาชิก", "เช็คชื่อ", "เสื้อสี"])
+    tabs = st.tabs(["งานที่ต้องทำ", "จัดนักกีฬา", "รายชื่อสี", "แก้ไขสมาชิก", "เช็คชื่อ", "สแตนด์", "เสื้อสี"])
 
     # ------------------------------------------------------------ งานที่ต้องทำ
     with tabs[0]:
@@ -104,4 +104,7 @@ def render(color_id: int) -> None:
             comp.attendance_panel(engine, f"{key}_att", color_id=color_id)
 
     with tabs[5]:
+        comp.stand_panel(engine, f"{key}_stand", color_id)
+
+    with tabs[6]:
         comp.shirt_panel(mine)

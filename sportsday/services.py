@@ -826,6 +826,7 @@ def move_color(engine: Engine, student_id: int, to_color_id: int, reason: str = 
             student_id=student_id, from_color_id=cur, to_color_id=to_color_id,
             reason=reason.strip(), moved_by=moved_by.strip(), moved_at=datetime.now(),
         ))
+        c.execute(delete(db.stand_seats).where(db.stand_seats.c.student_id == student_id))  # ที่นั่งสแตนด์สีเดิม
         if remove_pending_entries and not pend.empty:
             c.execute(delete(db.entries).where(and_(
                 db.entries.c.student_id == student_id, db.entries.c.event_id.in_(pend.event_id.tolist()))))
@@ -1442,3 +1443,141 @@ def data_counts(engine: Engine) -> dict[str, int]:
     with engine.connect() as c:
         return {t.name: c.execute(select(func.count()).select_from(t)).scalar() if t.name in have else 0
                 for t in db.metadata.sorted_tables}
+
+
+# ---------------------------------------------------------------- สรุปเช็คชื่อรายวัน
+
+def daily_summary(engine: Engine, color_id: int | None = None) -> pd.DataFrame:
+    """สรุปทุกวันทุกรอบ: ทั้งหมด / มา / สาย / ลา / ขาด / ยังไม่เช็ค / ร้อยละมา (นับสายเป็นมา)
+    คำนวณครั้งเดียวจากข้อมูลทั้งหมด (ไม่ query ทีละรอบ)"""
+    cols = ["session_id", "day", "color", "รอบ", "กิจกรรม", "ทั้งหมด", *ATT_STATUSES, "ยังไม่เช็ค", "ร้อยละมา"]
+    ses = sessions_df(engine)
+    if color_id is not None:
+        ses = ses[ses.color_id == color_id]
+    if ses.empty:
+        return pd.DataFrame(columns=cols)
+    st = students_df(engine)
+    att = _attendance_rows(engine)
+    en = entries_df(engine)
+    roles = roles_df(engine).set_index("id")["name"].to_dict()
+    names = list_colors(engine).set_index("id")["name"].to_dict()
+    rows = []
+    for s in ses.itertuples():
+        pool = st
+        if pd.notna(s.event_id):
+            pool = pool[pool.id.isin(en.loc[en.event_id == s.event_id, "student_id"])]
+        if pd.notna(s.role_id):
+            rname = roles.get(int(s.role_id))
+            pool = pool[pool.roles.map(lambda rs, r=rname: r in rs)]
+        if pd.notna(s.color_id):
+            pool = pool[pool.color_id == s.color_id]
+        mine = att[(att.session_id == s.id) & att.student_id.isin(pool.id)]
+        cnt = mine["status"].value_counts()
+        total = len(pool)
+        came = int(cnt.get("มา", 0) + cnt.get("สาย", 0))
+        rows.append({
+            "session_id": int(s.id), "day": s.day,
+            "color": f"สี{names[int(s.color_id)]}" if pd.notna(s.color_id) and int(s.color_id) in names else "ทุกสี",
+            "รอบ": str(s.title).split(" (สี")[0], "กิจกรรม": s.activity, "ทั้งหมด": total,
+            **{k: int(cnt.get(k, 0)) for k in ATT_STATUSES},
+            "ยังไม่เช็ค": total - len(mine), "ร้อยละมา": round(came / total * 100) if total else 0,
+        })
+    out = pd.DataFrame(rows, columns=cols)
+    order = {sid: i for i, sid in enumerate(ses.sort_values(["day", "id"])["id"])}
+    out["_o"] = out["session_id"].map(order)
+    return out.sort_values(["day", "color", "_o"], ascending=[False, True, True]).drop(columns="_o").reset_index(drop=True)
+
+
+def absent_list(engine: Engine, session_ids: Iterable[int], statuses=("ขาด", "ลา", "สาย")) -> pd.DataFrame:
+    """รายชื่อคนที่ ขาด/ลา/สาย ในรอบที่เลือก"""
+    att = _attendance_rows(engine)
+    att = att[att.session_id.isin(list(session_ids)) & att.status.isin(statuses)]
+    st = students_df(engine, include_inactive=True)[["id", "full_name", "class", "color"]]
+    ses = sessions_df(engine)[["id", "title"]]
+    df = att.merge(st, left_on="student_id", right_on="id").merge(ses, left_on="session_id", right_on="id",
+                                                                 suffixes=("", "_ses"))
+    df["รอบ"] = df["title"].str.split(" (สี", regex=False).str[0]
+    return df[["รอบ", "status", "full_name", "class", "color", "note"]].sort_values(["status", "รอบ", "class", "full_name"])
+
+
+# ---------------------------------------------------------------- แผนผังนั่งสแตนด์
+
+STAND_ROLE = "ขึ้นสแตนด์"
+ROW_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def stand_size(engine: Engine) -> tuple[int, int]:
+    """(จำนวนแถว, ที่นั่งต่อแถว) ค่าเริ่มต้น 5 x 10"""
+    try:
+        return int(get_setting(engine, "stand_rows") or 5), int(get_setting(engine, "stand_cols") or 10)
+    except ValueError:
+        return 5, 10
+
+
+def set_stand_size(engine: Engine, rows: int, cols: int) -> None:
+    if not (1 <= rows <= 26 and 1 <= cols <= 40):
+        raise ValueError("แถว 1–26 และที่นั่งต่อแถว 1–40")
+    set_setting(engine, "stand_rows", str(int(rows)))
+    set_setting(engine, "stand_cols", str(int(cols)))
+
+
+def seat_label(row: int, col: int) -> str:
+    return f"{ROW_LABELS[row - 1]}{col}"
+
+
+@cached
+def stand_seats(engine: Engine, color_id: int) -> pd.DataFrame:
+    """ที่นั่งที่จัดแล้วของสี: row, col, student_id, full_name, first_name, class, gender"""
+    s = db.stand_seats.c
+    with engine.connect() as c:
+        df = pd.read_sql(select(s.row, s.col, s.student_id).where(s.color_id == color_id), c)
+    st = students_df(engine, include_inactive=True)[["id", "full_name", "first_name", "class", "gender", "color_id"]]
+    return df.merge(st, left_on="student_id", right_on="id", how="left").drop(columns="id")
+
+
+def save_stand(engine: Engine, color_id: int, seats: dict[tuple[int, int], int]) -> int:
+    """บันทึกแผนผังทั้งสีแทนของเดิม {(แถว, ที่): student_id} · คนหนึ่งนั่งได้ที่เดียว"""
+    rows, cols = stand_size(engine)
+    ids = [int(v) for v in seats.values() if v]
+    dup = {i for i in ids if ids.count(i) > 1}
+    if dup:
+        names = students_df(engine, include_inactive=True).set_index("id")["full_name"]
+        raise ValueError("มีชื่อซ้ำมากกว่า 1 ที่: " + ", ".join(names.get(i, str(i)) for i in dup))
+    with engine.begin() as c:
+        c.execute(delete(db.stand_seats).where(db.stand_seats.c.color_id == color_id))
+        data = [{"color_id": color_id, "row": int(r), "col": int(k), "student_id": int(v)}
+                for (r, k), v in seats.items() if v and 1 <= r <= rows and 1 <= k <= cols]
+        if data:
+            c.execute(insert(db.stand_seats), data)
+    return len(ids)
+
+
+def stand_candidates(engine: Engine, color_id: int, only_role: bool = True) -> pd.DataFrame:
+    """นักเรียนของสีที่จัดลงสแตนด์ได้ (ค่าเริ่มต้น: เฉพาะคนที่มีหน้าที่ ขึ้นสแตนด์) เรียงตามชั้น/ห้อง/ชื่อ"""
+    st = students_df(engine)
+    st = st[st.color_id == color_id]
+    if only_role:
+        st = st[st.roles.map(lambda rs: STAND_ROLE in rs)]
+    return st.sort_values(["grade", "room", "first_name"])
+
+
+def auto_fill_stand(engine: Engine, color_id: int, mode: str = "ชั้น", keep_existing: bool = True,
+                    only_role: bool = True) -> tuple[int, int]:
+    """จัดที่นั่งอัตโนมัติ เติมจากแถวหน้า (A) ซ้ายไปขวา · mode: ชั้น = เรียงตามชั้น/ห้อง · สลับชายหญิง = ชายหญิงสลับกัน
+    คืน (จำนวนที่จัด, จำนวนคนที่ไม่มีที่นั่ง)"""
+    rows, cols = stand_size(engine)
+    cur = stand_seats(engine, color_id)
+    seats = {(int(r.row), int(r.col)): int(r.student_id) for r in cur.itertuples()} if keep_existing else {}
+    seated = set(seats.values())
+    pool = stand_candidates(engine, color_id, only_role)
+    pool = pool[~pool.id.isin(seated)]
+    if mode == "สลับชายหญิง":
+        m, f = pool[pool.gender == "ชาย"]["id"].tolist(), pool[pool.gender != "ชาย"]["id"].tolist()
+        order = [x for pair in zip(m, f) for x in pair] + m[len(f):] + f[len(m):]
+    else:
+        order = pool["id"].tolist()
+    free = [(r, k) for r in range(1, rows + 1) for k in range(1, cols + 1) if (r, k) not in seats]
+    for spot, sid in zip(free, order):
+        seats[spot] = int(sid)
+    save_stand(engine, color_id, seats)
+    return min(len(free), len(order)), max(0, len(order) - len(free))

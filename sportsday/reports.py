@@ -444,3 +444,60 @@ def certificate_register(items: pd.DataFrame, prefix: str = "") -> bytes:
         for col, w in zip("ABCDEF", [14, 32, 10, 10, 34, 40]):
             ws.column_dimensions[col].width = w
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------- แผนผังสแตนด์
+
+def stand_pdf(engine: Engine, color_ids: list[int]) -> bytes:
+    """แผนผังนั่งสแตนด์ A4 แนวนอน สีละ 1 หน้า · แถวหลังอยู่บน แถวหน้า (A) อยู่ล่างติดสนาม"""
+    from reportlab.lib.pagesizes import landscape
+    _register_fonts()
+    rows, cols = sv.stand_size(engine)
+    colors_df = sv.list_colors(engine).set_index("id")
+    title = sv.get_setting(engine, "event_title")
+    school = sv.get_setting(engine, "school_name")
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=10 * mm, rightMargin=10 * mm,
+                            topMargin=10 * mm, bottomMargin=10 * mm, title="แผนผังนั่งสแตนด์")
+    head = ParagraphStyle("h", fontName="Sarabun-Bold", fontSize=18, leading=24, alignment=TA_CENTER)
+    sub = ParagraphStyle("s", fontName="Sarabun", fontSize=11, leading=15, alignment=TA_CENTER,
+                         textColor=rl_colors.HexColor("#555555"))
+    cell = ParagraphStyle("c", fontName="Sarabun", fontSize=8.5, leading=11, alignment=TA_CENTER)
+    story = []
+    W = landscape(A4)[0] - 20 * mm
+    for n, cid in enumerate(color_ids):
+        if n:
+            story.append(PageBreak())
+        seats = sv.stand_seats(engine, cid)
+        at = {(int(r.row), int(r.col)): r for r in seats.rename(columns={"class": "klass"}).itertuples()}
+        story += [Paragraph(f"แผนผังนั่งสแตนด์ สี{colors_df.loc[cid, 'name']}", head),
+                  Paragraph(f"{school} · {title} · จัดแล้ว {len(seats)} จาก {rows * cols} ที่", sub), Spacer(1, 4 * mm)]
+        data = [[""] + [Paragraph(f"<b>{k}</b>", cell) for k in range(1, cols + 1)]]
+        for r in range(rows, 0, -1):
+            line = [Paragraph(f"<b>{sv.ROW_LABELS[r - 1]}</b>", cell)]
+            for k in range(1, cols + 1):
+                s = at.get((r, k))
+                line.append(Paragraph(f"<font size=7 color='#888888'>{sv.seat_label(r, k)}</font><br/>"
+                                      f"<b>{s.first_name}</b><br/><font size=7.5>{s.klass}</font>"
+                                      if s is not None else f"<font size=7 color='#bbbbbb'>{sv.seat_label(r, k)}</font>",
+                                      cell))
+            data.append(line)
+        cw = (W - 10 * mm) / cols
+        t = Table(data, colWidths=[10 * mm] + [cw] * cols, rowHeights=[7 * mm] + [24 * mm] * rows)
+        style = [("GRID", (1, 1), (-1, -1), 0.6, rl_colors.HexColor("#999999")),
+                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]
+        for r_i in range(rows):
+            for k in range(cols):
+                s = at.get((rows - r_i, k + 1))
+                if s is not None:
+                    bg = "#e3effd" if s.gender == "ชาย" else "#fde7ee"
+                    style.append(("BACKGROUND", (k + 1, r_i + 1), (k + 1, r_i + 1), rl_colors.HexColor(bg)))
+        t.setStyle(TableStyle(style))
+        story.append(t)
+        field = Table([[Paragraph("<b>ด้านหน้า · สนาม</b>", ParagraphStyle("f", parent=cell, fontSize=11, leading=15))]],
+                      colWidths=[W - 10 * mm], rowHeights=[9 * mm])
+        field.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), rl_colors.HexColor("#cdeee4")),
+                                   ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+        story += [Spacer(1, 2 * mm), Table([[None, field]], colWidths=[10 * mm, W - 10 * mm])]
+    doc.build(story)
+    return buf.getvalue()

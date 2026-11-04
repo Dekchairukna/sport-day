@@ -172,6 +172,15 @@ attendance = Table(
     Column("note", Text, nullable=False, default=""),
 )
 
+stand_seats = Table(  # แผนผังนั่งสแตนด์ของแต่ละสี (แถว 1 = แถวหน้าติดสนาม)
+    "stand_seats",
+    metadata,
+    Column("color_id", Integer, ForeignKey("colors.id", ondelete="CASCADE"), primary_key=True),
+    Column("row", Integer, primary_key=True),
+    Column("col", Integer, primary_key=True),
+    Column("student_id", Integer, ForeignKey("students.id", ondelete="CASCADE"), nullable=False),
+)
+
 attendance_log = Table(  # ประวัติการเปลี่ยนผลเช็คชื่อ (ไม่ผูก FK เพื่อให้ประวัติอยู่แม้ลบรอบ)
     "attendance_log",
     metadata,
